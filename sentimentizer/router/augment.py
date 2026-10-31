@@ -1,4 +1,4 @@
-"""Augment seed utterances using GLM 5.1 via Ollama API.
+"""Augment task-specific seed utterances using GLM 5.1 via Ollama API.
 
 Generates hard negatives: text that sounds like one category but
 belongs to another (e.g., "The bread was so dry" → General, not Dietary).
@@ -10,14 +10,18 @@ import time
 
 import requests
 
-from sentimentizer.router.config import RouteLabels
+from sentimentizer.router.config import FOOD_TASK_SPEC
+from sentimentizer.router.schemas import RouterTaskSpec
 
 logger = logging.getLogger(__name__)
 
-LABEL_NAMES = RouteLabels.label_names()
+AUGMENT_REQUEST_TIMEOUT_S = 120
+AUGMENT_PAUSE_S = 0.5
 
 
-def _build_prompt(seed_text: str, seed_label: int, num_variations: int) -> str:
+def _build_prompt(
+    seed_text: str, seed_label: int, num_variations: int, *, task: RouterTaskSpec | None = None
+) -> str:
     """Build the augmentation prompt for GLM 5.1.
 
     Loads the prompt template from sentimentizer/prompts/augment_router.txt
@@ -25,23 +29,26 @@ def _build_prompt(seed_text: str, seed_label: int, num_variations: int) -> str:
 
     Args:
         seed_text: Original utterance text.
-        seed_label: Original label (0=dietary, 1=service, 2=general).
+        seed_label: Original class ID in the task's ordered vocabulary.
         num_variations: Number of variations to generate.
+        task: Label definitions; defaults to the shipped food task.
 
     Returns:
         Formatted prompt string for the Ollama API.
     """
     from sentimentizer.prompts import load_prompt
 
-    seed_category = LABEL_NAMES[seed_label]
-    other_categories = [v for k, v in LABEL_NAMES.items() if k != seed_label]
+    task = task or FOOD_TASK_SPEC
+    seed_category = task.labels[task.label_id(seed_label)]
+    other_categories = [label for label in task.labels if label != seed_category]
     template = load_prompt("augment_router")
     return template.format(
         num_variations=num_variations,
         seed_text=seed_text,
         seed_category=seed_category,
-        other_category_1=other_categories[0],
-        other_category_2=other_categories[1],
+        task_description=task.description,
+        label_descriptions=json.dumps(task.label_descriptions),
+        other_categories=json.dumps(other_categories),
         seed_label=seed_label,
     )
 
@@ -83,6 +90,8 @@ def augment_seeds(
     batch_size: int = 5,
     output_path: str | None = None,
     resume: bool = False,
+    *,
+    task: RouterTaskSpec | None = None,
 ) -> list[dict]:
     """Expand seed utterances using GLM 5.1 via Ollama API.
 
@@ -116,6 +125,12 @@ def augment_seeds(
         Original seeds + augmented utterances with the same format.
     """
     from pathlib import Path
+
+    task = task or FOOD_TASK_SPEC
+    for seed in seeds:
+        task.label_id(seed["label"])
+        if not isinstance(seed.get("text"), str) or not seed["text"].strip():
+            raise ValueError("Augmentation seeds require nonempty text")
 
     # Resume mode: load existing entries and determine which seeds to process
     if resume and output_path and Path(output_path).exists():
@@ -151,6 +166,7 @@ def augment_seeds(
                     variations_per_seed,
                     batch_size,
                     out_file,
+                    task=task,
                 )
         else:
             # Write new file (seed utterances first)
@@ -167,6 +183,7 @@ def augment_seeds(
                     variations_per_seed,
                     batch_size,
                     out_file,
+                    task=task,
                 )
     else:
         augmented = _augment_loop(
@@ -176,6 +193,7 @@ def augment_seeds(
             ollama_url,
             variations_per_seed,
             batch_size,
+            task=task,
         )
 
     logger.info(f"Augmented {len(seeds)} seeds → {len(augmented)} total utterances")
@@ -192,6 +210,8 @@ def _augment_loop(
     variations_per_seed: int,
     batch_size: int,
     out_file: object | None = None,
+    *,
+    task: RouterTaskSpec | None = None,
 ) -> list[dict]:
     """Inner loop for augmentation, optionally streaming to an open file.
 
@@ -207,15 +227,16 @@ def _augment_loop(
     Returns:
         Updated accumulator list with augmented entries.
     """
+    task = task or FOOD_TASK_SPEC
     for i in range(0, len(seeds), batch_size):
         batch = seeds[i : i + batch_size]
         for seed in batch:
-            prompt = _build_prompt(seed["text"], seed["label"], variations_per_seed)
+            prompt = _build_prompt(seed["text"], seed["label"], variations_per_seed, task=task)
             try:
                 response = requests.post(
                     ollama_url,
                     json={"model": model, "prompt": prompt, "stream": False},
-                    timeout=120,
+                    timeout=AUGMENT_REQUEST_TIMEOUT_S,
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -226,15 +247,23 @@ def _augment_loop(
                         continue
                     try:
                         entry = json.loads(line)
-                        if "text" in entry and "label" in entry:
+                        if (
+                            isinstance(entry, dict)
+                            and isinstance(entry.get("text"), str)
+                            and entry["text"].strip()
+                            and task.label_id(entry.get("label")) == seed["label"]
+                        ):
+                            entry.update(
+                                {k: v for k, v in seed.items() if k not in {"text", "label"}}
+                            )
                             augmented.append(entry)
                             if out_file:
                                 out_file.write(json.dumps(entry) + "\n")
-                    except json.JSONDecodeError:
-                        logger.warning(f"Failed to parse augmentation line: {line}")
+                    except (json.JSONDecodeError, ValueError):
+                        logger.warning("Skipped invalid augmentation entry")
                 if out_file:
                     out_file.flush()
             except requests.RequestException as e:
                 logger.error(f"Ollama API request failed: {e}")
-            time.sleep(0.5)  # rate limiting
+            time.sleep(AUGMENT_PAUSE_S)
     return augmented

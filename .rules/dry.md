@@ -11,9 +11,10 @@ schemas, and configuration alike.
 - **Constants and magic values**: `LABEL_NAMES`, `NUM_CLASSES`, model type
   strings, gauge names, and config defaults live in `config.py` or the owning
   module, named once. Never inline the same literal in two places.
-- **Schema**: the Pydantic v2 models in `serve/models.py` and
-  `serve/embeddings_models.py` are the single source of truth for the
-  request/response shapes — do not restate field shapes in docstrings or ad-hoc
+- **Schema**: Pydantic v2 models in `router/schemas.py` own shared router task,
+  classification, and artifact metadata contracts. HTTP envelopes in
+  `serve/models.py` reuse these types; `serve/embeddings_models.py` owns embedding
+  request/response shapes. Do not restate field shapes in docstrings or ad-hoc
   dicts. Use the model's `.model_dump()` / `.model_json_schema()` instead of
   re-typing.
 - **Behavioral knowledge**: the 3-class contract, metrics computation, class

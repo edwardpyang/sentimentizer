@@ -106,6 +106,7 @@ from sentimentizer.serve.models import (
     PredictRequest,
     PredictResponse,
     RouterBatchResponse,
+    RouterBatchResultItem,
     RouterModelsResponse,
     RouterPredictResponse,
     TokenizeRequest,
@@ -676,13 +677,18 @@ class SentimentizerDeployment:
     # ------------------------------------------------------------------
 
     @app.post("/v1/router/predict", response_model=RouterPredictResponse)
-    async def router_predict(self, body: PredictRequest, request: Request) -> dict[str, Any]:
+    async def router_predict(self, body: PredictRequest, request: Request) -> RouterPredictResponse:
         """POST /v1/router/predict -- classify a single text (auto-batched)."""
         self._require_ready()
 
         start = time.perf_counter()
         try:
             raw_result = await self.classify_route({"text": body.text})
+            item = RouterBatchResultItem.model_validate(raw_result)
+            latency = time.perf_counter() - start
+            response = RouterPredictResponse(
+                prediction=item.prediction, latency_s=round(latency, 4)
+            )
         except Exception:
             latency = time.perf_counter() - start
             self._router_metrics.record_request(latency, error=True)
@@ -692,31 +698,31 @@ class SentimentizerDeployment:
                     detail=f"Router model not loaded: {self.predictor.router_error}",
                 ) from None
             raise
-        latency = time.perf_counter() - start
-
         self._router_metrics.record_request(latency)
-        prediction = raw_result.get("prediction", {})
         request_id = getattr(request.state, "request_id", "unknown")
         logger.info(
             "router prediction completed",
             request_id=request_id,
             input_length=len(body.text),
             latency_s=f"{latency:.4f}",
-            category=prediction.get("label", ""),
+            category=response.prediction.label,
         )
-        return {
-            "prediction": prediction,
-            "latency_s": round(latency, 4),
-        }
+        return response
 
     @app.post("/v1/router/batch", response_model=RouterBatchResponse)
-    async def router_batch(self, body: BatchRequest, request: Request) -> dict[str, Any]:
+    async def router_batch(self, body: BatchRequest, request: Request) -> RouterBatchResponse:
         """POST /v1/router/batch -- classify multiple texts into routes."""
         self._require_ready()
 
         start = time.perf_counter()
         try:
             results = await asyncio.to_thread(self.predictor.classify_batch, body.texts)
+            if len(results) != len(body.texts):
+                raise ValueError("Router batch results must match the number of input texts")
+            latency = time.perf_counter() - start
+            response = RouterBatchResponse(
+                results=results, count=len(results), latency_s=round(latency, 4)
+            )
         except Exception:
             latency = time.perf_counter() - start
             self._router_metrics.record_request(latency, error=True)
@@ -726,8 +732,6 @@ class SentimentizerDeployment:
                     detail=f"Router model not loaded: {self.predictor.router_error}",
                 ) from None
             raise
-        latency = time.perf_counter() - start
-
         self._router_metrics.record_request(latency)
         request_id = getattr(request.state, "request_id", "unknown")
         logger.info(
@@ -736,17 +740,13 @@ class SentimentizerDeployment:
             batch_size=len(body.texts),
             latency_s=f"{latency:.4f}",
         )
-        return {
-            "results": results,
-            "count": len(results),
-            "latency_s": round(latency, 4),
-        }
+        return response
 
     @app.get("/v1/router/models", response_model=RouterModelsResponse)
-    async def router_models(self) -> dict[str, Any]:
+    async def router_models(self) -> RouterModelsResponse:
         """GET /v1/router/models -- router model metadata."""
         self._require_ready()
-        return self.predictor.get_router_model_info()
+        return RouterModelsResponse.model_validate(self.predictor.get_router_model_info())
 
     # ------------------------------------------------------------------
     # Infrastructure handlers (unversioned)

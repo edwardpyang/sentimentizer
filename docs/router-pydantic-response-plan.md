@@ -1,13 +1,17 @@
 # Router Pydantic JSON response plan
 
-**Status:** 📋 Not started — 2026-10-31
+**Status:** ✅ Completed — 2026-10-31
 
-**Direction update (2026-10-31):** Follow the
-[generic router plan](generic-router-plan.md) for implementation. The shared
-classifier will use artifact-defined labels with food-review defaults, rather
-than the fixed RouteCategory enum and mandatory three-label mapping below.
-The response envelopes, bounds, batch checks, and producer fixes remain useful;
-the newer plan resolves conflicts. This document retains the original review.
+_Original status: 📋 Not started — 2026-10-31_
+
+**Implemented direction (2026-10-31):** The
+[generic router plan](generic-router-plan.md) implements these response changes
+with artifact-defined labels and food-review defaults, replacing the fixed
+RouteCategory enum and mandatory three-label mapping below. Response envelopes,
+bounds, batch checks, metadata correction, and confidence mapping are implemented
+and tested. The final `make ci` passed: 796 tests passed, one skipped, zero
+pyright errors, and successful package builds. This document retains the
+original review; current contracts are in [the router guide](router.md).
 
 ## Goal
 

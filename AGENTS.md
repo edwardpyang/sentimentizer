@@ -121,6 +121,7 @@ sentimentizer/
     bge_m3.py          — BGE-M3 dense/sparse embeddings
     predictor.py
   router/              — Intent router (SentenceTransformer + LogisticRegression)
+    schemas.py         — Shared task, classification, and artifact metadata schemas
     config.py          — RouterConfig (alias SetFitConfig), RouteLabels, AugmentConfig
     model.py           — RouterModel: backbone + sklearn head
     seeds.py           — Golden example utterances (10 per category)
@@ -276,8 +277,17 @@ required after any dashboard change.
   The HTTP layer wraps this in `"prediction": {...}` with `"latency_s"`.
   `token_count` comes from `len(regex_tokenize(text))` computed during existing
   tokenization — no extra cost.
-- **`classify_batch()`** returns `{"prediction": {"label": "dietary", "score":
-  0.95, "token_count": 8}}` — no `text` or `category` key.
+- **Router Python and HTTP responses:** `classify_batch()` returns a list of
+  `{"prediction": {"label": "dietary", "score": 0.95, "token_count": 8}}`
+  dictionaries; `classify()` returns one item. HTTP single responses add
+  `latency_s`; HTTP batch responses wrap the list in `results`, with `count`
+  and `latency_s`. Prediction objects have no `text`, `category`, or `model`
+  field. Shared Pydantic task/classification schemas live in `router/schemas.py`;
+  HTTP envelopes in `serve/models.py` reuse them. Router handlers return typed
+  response models and validate before success accounting. Scores are finite in
+  `[0,1]`; counts and latency are nonnegative; batches must be complete. Labels
+  come from the loaded artifact and probabilities follow `head.classes_` order.
+  Keep additional task configurations external to the food-focused defaults.
 - **FastAPI + `@serve.ingress`, one app per deployment.** There is **no mounted
   `v1` sub-app** — routes declare their full path on the app returned by
   `create_fastapi_app()`, e.g. `@app.post("/v1/sentiment/predict")`. Health
@@ -328,7 +338,8 @@ required after any dashboard change.
   model exists but is not loaded.
 - **`serve/base.py` holds `ServiceMetrics`, `_DummyServe`, and
   `render_service_metrics()`.** Response dicts are built directly in route
-  handlers — there are no response-builder helpers.
+  handlers, except router handlers return typed response models — there are no
+  response-builder helpers.
 - **Router loads lazily.** `SentimentPredictor.__init__` does not load the
   router model; `_ensure_router_loaded()` runs on the first
   `classify()`/`classify_batch()` and memoizes success *and* failure. Serve
@@ -463,13 +474,22 @@ required after any dashboard change.
   `num_epochs=1`, `batch_size=16`, `max_seq_length=512`, `seed=42`,
   `output_dir=models/router`. Move to `mxbai-embed-large-v1` (335M) only if
   evaluation thresholds are not met.
-- **Categories** in `RouteLabels`: dietary (0) — allergies, celiac, FODMAP,
+- **Default food categories** in `RouteLabels`: dietary (0) — allergies, celiac, FODMAP,
   ingredient safety; service (1) — wait times, staff, reservations; general (2)
   — ambiance, price, general food quality.
 - **Seeds**: 10 utterances per category in `seeds.py`, expanded by `augment.py`
   (`AugmentConfig`: GLM 5.1 via Ollama at `http://localhost:11434/api/generate`,
   default model `glm-5.1:cloud`, 50 variations per seed).
-- **Targets**: inter-class similarity < 0.65, intra-class > 0.85.
+- **Generic task configuration:** `RouterConfig.task` defines ordered labels,
+  descriptions, task/version IDs, input format, and optional fallback. Artifacts
+  save that spec; runtime code must not substitute `RouteLabels` for custom
+  vocabularies. `RouterModel.classify_batch()` returns `RouterClassification`
+  objects without loading sentiment weights. Empty augmentation.seed_path uses
+  bundled seeds only for the default food task; custom tasks supply JSONL seeds.
+- **Evaluation** reports all saved classes, observed centroid similarities,
+  and confidence statistics. The centroid matrix diagonal is self-similarity,
+  not an intra-class metric. The optional historical tau heuristic uses the
+  configured fallback and is not a calibrated serving policy.
 - Pipeline: `make router-augment` → `make router-train` → `make router-evaluate`;
   `make upload-router` pushes to the Hub.
 - Router ONNX export is deferred to v2 — the router runs Python inference.

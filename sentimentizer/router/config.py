@@ -12,11 +12,27 @@ values < environment variable overrides.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from sentimentizer.router.schemas import RouterTaskSpec
+
+DEFAULT_ROUTER_MODEL_PATH = "models/router"
+
+FOOD_TASK_SPEC = RouterTaskSpec(
+    task_id="food_reviews",
+    description="Classify restaurant reviews by topic.",
+    labels=("dietary", "service", "general"),
+    label_descriptions={
+        "dietary": "Allergies, dietary restrictions, and ingredient suitability.",
+        "service": "Staff, waiting, reservations, and service experience.",
+        "general": "Food quality, ambiance, price, and other review topics.",
+    },
+    fallback_label="general",
+)
 
 
 @dataclass(frozen=True)
@@ -31,6 +47,7 @@ class RouterConfig:
         max_seq_length: Maximum token sequence length for the tokenizer.
         seed: Random seed for reproducibility.
         output_dir: Directory to save the trained model.
+        task: Ordered vocabulary and input-format contract saved with the model.
     """
 
     base_model: str = "BAAI/bge-base-en-v1.5"
@@ -39,7 +56,8 @@ class RouterConfig:
     batch_size: int = 16
     max_seq_length: int = 512
     seed: int = 42
-    output_dir: Path = Path("models/router")
+    output_dir: Path = Path(DEFAULT_ROUTER_MODEL_PATH)
+    task: RouterTaskSpec = field(default_factory=lambda: FOOD_TASK_SPEC.model_copy(deep=True))
 
 
 # Backward-compatible alias — existing code that references SetFitConfig
@@ -57,6 +75,7 @@ class AugmentConfig:
         variations_per_seed: Number of variations to generate per seed utterance.
         output_path: Default output JSONL file path.
         batch_size: Number of seeds to process per API batch.
+        seed_path: External JSONL seeds, or empty for the default food seeds.
     """
 
     model: str = "glm-5.1:cloud"
@@ -64,6 +83,7 @@ class AugmentConfig:
     variations_per_seed: int = 50
     output_path: str = "augmented_yelp.jsonl"
     batch_size: int = 5
+    seed_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,12 +103,12 @@ class RouteLabels:
     @classmethod
     def label_names(cls) -> dict[int, str]:
         """Return mapping from label ID to name."""
-        return {0: "dietary", 1: "service", 2: "general"}
+        return dict(enumerate(FOOD_TASK_SPEC.labels))
 
     @classmethod
     def num_classes(cls) -> int:
         """Return the number of route categories."""
-        return 3
+        return len(FOOD_TASK_SPEC.labels)
 
 
 # Environment-variable overrides. (env_var → (section, field, coerce_fn)).
@@ -107,6 +127,7 @@ _ENV_OVERRIDES: dict[str, tuple[str, str, type]] = {
     "SENTIMENTIZER_AUGMENT_VARIATIONS_PER_SEED": ("augmentation", "variations_per_seed", int),
     "SENTIMENTIZER_AUGMENT_OUTPUT_PATH": ("augmentation", "output_path", str),
     "SENTIMENTIZER_AUGMENT_BATCH_SIZE": ("augmentation", "batch_size", int),
+    "SENTIMENTIZER_AUGMENT_SEED_PATH": ("augmentation", "seed_path", str),
 }
 
 
@@ -160,5 +181,7 @@ def load_router_config(
 
     if "output_dir" in sections["training"]:
         sections["training"]["output_dir"] = Path(sections["training"]["output_dir"])
+    if "task" in sections["training"]:
+        sections["training"]["task"] = RouterTaskSpec.model_validate(sections["training"]["task"])
 
     return RouterConfig(**sections["training"]), AugmentConfig(**sections["augmentation"])

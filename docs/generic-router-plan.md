@@ -1,28 +1,38 @@
 # Generic router with food-review defaults
 
-**Status:** 📋 Not started — 2026-10-31
+**Status:** ✅ Completed — 2026-10-31
+
+_Original status: 📋 Not started — 2026-10-31_
+
+_Previous status: ⏳ Partially implemented — 2026-10-31_
+
+All three milestones are implemented: shared schemas/config/artifacts;
+task-aware training, augmentation, and evaluation; and typed HTTP responses
+with current documentation. The final `make ci` gate passed with 796 tests
+passed, one skipped, zero pyright errors, and successful wheel/sdist builds.
+Coverage includes native sklearn head round trips, atomic metadata publication
+and failure cleanup, legacy food compatibility, custom vocabularies, HTTP
+validation/error metrics, and CLI configuration/report output.
 
 ## Goal and scope
 
 Make the existing router reusable for different classification tasks while
 keeping the repository's shipped configuration, seeds, examples, and default
 model food-related. Use the same implementation with separately trained model
-artifacts for food reviews and a possible future chemistry workflow.
+artifacts for food reviews and other future classification tasks.
 
 This is the current implementation direction. It supersedes the fixed router
-enum in [the response plan](router-pydantic-response-plan.md) and defers the
-chemistry-specific modules/endpoints in
-[the episode proposal](chemistry-episode-classification-plan.md). Neither
-chemistry training data nor a chemistry configuration is to be shipped now.
+enum in [the response plan](router-pydantic-response-plan.md). Shipped
+configuration and training examples remain focused on food reviews.
 
 In scope: task metadata, arbitrary label counts, generic probability mapping,
 configurable augmentation inputs, task-aware training/evaluation, artifact
 compatibility, typed responses, and regression tests with a synthetic non-food
 task. Out of scope: a mixed-domain trained head, automatic domain detection,
-multiple loaded routers per replica, dynamic model registries, chemistry outcome
-rules, episode endpoints, and changes to the three-class sentiment models.
+multiple loaded routers per replica, dynamic model registries, domain-specific
+outcome rules, episode endpoints, and changes to the three-class sentiment models.
 
-## Source review and assumptions
+## Pre-implementation source review and assumptions
 
 Verified from local code on 2026-10-31 on `extract-imagenate`:
 
@@ -41,8 +51,8 @@ Verified from local code on 2026-10-31 on `extract-imagenate`:
 - Existing response models have the shape/numeric/cardinality gaps documented
   in the original response plan. No live model performance has been measured.
 
-The user wants reuse later, rather than a chemistry deployment now. Assume one
-configured router artifact per service instance; external consumers can use
+Support reuse through external configuration. Assume one configured router
+artifact per service instance; external consumers can use
 RouterModel directly without loading sentiment weights or the GloVe dictionary.
 
 ## Architecture
@@ -125,7 +135,8 @@ task:
 load_router_config keeps its return signature, converts the nested task dict
 to RouterTaskSpec, and accepts older food YAML without a task section. The CLI
 uses dataclasses.replace for explicit overrides instead of reconstructing a
-partial RouterConfig. No production chemistry config or seeds are added.
+partial RouterConfig. Additional task configurations and seeds are supplied
+externally.
 Document `seed_path: ""` under the shipped augmentation section; existing files
 without that field retain the same bundled food seeds.
 
@@ -214,19 +225,17 @@ helper is a historical heuristic, not a calibrated acceptance guarantee; tasks
 without a fallback return tau_threshold=null and still get classification
 reports and confidence statistics.
 
-## Future chemistry use
+## Reuse with external configurations
 
-An external chemistry config/data set can train another artifact through the
-same API. Its integration formats prompt/actions/results into stable text and
-sets an appropriate input_format version. A different label set needs a newly
-trained head, and potentially a fine-tuned backbone if evaluation warrants it;
-switching YAML does not convert food weights into a chemistry classifier.
+An external task configuration and dataset can train another artifact through
+the same API. Its integration supplies consistently formatted text and records
+the input_format version. A different label set needs a newly trained head,
+and potentially a fine-tuned backbone if evaluation warrants it. Changing YAML
+alone does not retrain existing weights.
 
-For the earlier example, the external task might label the action sequence as
-material_substitution. Its integration can attach new_formulation_created using
-the creation action and artifact reference. Outcome/evidence schemas remain a
-later adapter concern. The generic food response does not acquire chemistry
-fields, and this change does not add chemistry modules or routes.
+The shared classifier returns label, score, and token count. Additional
+domain-specific processing belongs in the calling integration, while the
+repository's default configuration, seeds, and examples remain food-related.
 
 ## Implementation order and testing
 
@@ -256,8 +265,8 @@ Use deterministic tests if implementation exposes a lifecycle interaction.
 
 ## Review, risks, and convention updates
 
-Review 1 removed chemistry-specific endpoints and the fixed enum from the
-shared design. Revision made training/runtime labels artifact-owned, kept
+Review 1 removed task-specific endpoints and the fixed enum from the shared
+design. Revision made training/runtime labels artifact-owned, kept
 food-specific defaults in config, and preserved external JSON prediction shape.
 Review 2 identified fallback downloads, partial CLI config overrides, pre-load
 metadata guessing, and the general-only evaluator; the above resolutions are
@@ -265,7 +274,7 @@ explicit. Re-review also retained legacy model APIs and separated schema
 ownership from serving configuration. A further revision clarified deep-copy
 defaults, explicit task/labels conflicts, and validation before class-ID
 coercion. Final re-review found no remaining implementation-blocking gaps in
-the generic core; actual chemistry labeling and evidence rules remain deferred.
+the generic core; additional task definitions remain external configuration.
 
 | Risk | Resolution |
 | --- | --- |
@@ -273,7 +282,7 @@ the generic core; actual chemistry labeling and evidence rules remain deferred.
 | Food behavior regresses. | Keep food YAML, seed examples, default artifact path, IDs, compatibility aliases, and regression coverage. |
 | A custom task quietly receives food labels/data. | Artifact-derived labels; explicit custom seeds; no automatic food download for custom paths. |
 | Pydantic schema becomes task-specific. | Static generic schema plus model-bound label membership validation and metadata discovery. |
-| Single-model reuse grows into a model registry. | One router artifact per instance; external chemistry deployment later. |
+| Single-model reuse grows into a model registry. | Keep one router artifact per service instance. |
 | Task refactor affects sentiment, scheduler, metrics, ONNX, or Ray lifecycle. | Keep these contracts unchanged; full make ci at each code milestone. |
 
 During implementation update README.md, router.md, serving.md,

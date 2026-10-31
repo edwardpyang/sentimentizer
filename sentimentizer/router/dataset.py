@@ -1,6 +1,6 @@
 """Dataset loading and train/test split for the router.
 
-Loads JSONL files with {"text": "...", "label": 0|1|2} format
+Loads JSONL files with text and integer task-label IDs
 and splits into train/test datasets for router training.
 """
 
@@ -15,6 +15,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def load_router_records(data_path: str | Path) -> list[dict]:
+    """Read labeled JSONL records, preserving caller-supplied metadata."""
+    records = []
+    with Path(data_path).open() as source:
+        for line_number, line in enumerate(source, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at line {line_number}") from exc
+            if (
+                not isinstance(record, dict)
+                or not isinstance(record.get("text"), str)
+                or not record["text"].strip()
+                or "label" not in record
+            ):
+                raise ValueError(f"Expected nonempty text and label at line {line_number}")
+            records.append(record)
+    return records
+
+
 def load_router_dataset(
     data_path: str = "augmented_yelp.jsonl",
     test_size: float = 0.2,
@@ -22,7 +44,7 @@ def load_router_dataset(
 ) -> tuple["Dataset", "Dataset"]:
     """Load JSONL dataset and split into train/test.
 
-    Format: {"text": "...", "label": 0|1|2}
+    Labels are integer IDs in the configured task's ordered vocabulary.
 
     Args:
         data_path: Path to the JSONL file.
@@ -61,7 +83,7 @@ def save_dataset_to_jsonl(
 
     with open(path, "w") as f:
         for entry in dataset:
-            f.write(f'{{"text": {json.dumps(entry["text"])}, "label": {entry["label"]}}}\n')
+            f.write(json.dumps(entry) + "\n")
 
     logger.info(f"Saved {len(dataset)} utterances to {path}")
     return path

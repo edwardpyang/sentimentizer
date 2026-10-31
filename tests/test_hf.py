@@ -751,34 +751,24 @@ class TestRouterAutoDownload:
         _mock_tokenizer: MagicMock,
         mock_get_model: MagicMock,
     ) -> None:
-        """When router path doesn't exist, snapshot_download is called on first classify()."""
-        import tempfile
-
+        """Only the default food router downloads lazily when its path is missing."""
+        from sentimentizer.config import HF_ROUTER_REPO
         from sentimentizer.predictor import SentimentPredictor
+        from sentimentizer.router.config import DEFAULT_ROUTER_MODEL_PATH
 
         mock_get_model.side_effect = FileNotFoundError("no weights")
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            router_path = Path(tmpdir) / "nonexistent_router"
-
-            with patch("sentimentizer.predictor.Path.exists") as mock_exists:
-                # Path.exists() returns False for the router path
-                mock_exists.return_value = False
-
-                with patch("huggingface_hub.snapshot_download") as mock_snap:
-                    predictor = SentimentPredictor(
-                        model_name="encoder",
-                        router_model_path=str(router_path),
-                    )
-                    # Router loads lazily — no download at construction.
-                    mock_snap.assert_not_called()
-                    # Trigger lazy load.
-                    with pytest.raises(RuntimeError):
-                        predictor.classify("hello")
-                    mock_snap.assert_called_once_with(
-                        repo_id="ryeyoo/sentimentizer-router",
-                        local_dir=str(router_path),
-                    )
+        with (
+            patch("sentimentizer.predictor.Path.exists", return_value=False),
+            patch("huggingface_hub.snapshot_download") as mock_snap,
+        ):
+            predictor = SentimentPredictor(model_name="encoder")
+            mock_snap.assert_not_called()
+            with pytest.raises(RuntimeError):
+                predictor.classify("hello")
+            mock_snap.assert_called_once_with(
+                repo_id=HF_ROUTER_REPO,
+                local_dir=DEFAULT_ROUTER_MODEL_PATH,
+            )
 
     @patch("sentimentizer.predictor.get_trained_model")
     @patch("sentimentizer.predictor.get_trained_tokenizer")
@@ -800,9 +790,12 @@ class TestRouterAutoDownload:
         with tempfile.TemporaryDirectory() as tmpdir:
             router_path = Path(tmpdir) / "nonexistent_router"
 
-            with patch(
-                "huggingface_hub.snapshot_download",
-                side_effect=ConnectionError("No network"),
+            with (
+                patch(
+                    "huggingface_hub.snapshot_download",
+                    side_effect=ConnectionError("No network"),
+                ) as download,
+                patch("sentimentizer.predictor.DEFAULT_ROUTER_MODEL_PATH", str(router_path)),
             ):
                 predictor = SentimentPredictor(
                     model_name="encoder",
@@ -816,6 +809,9 @@ class TestRouterAutoDownload:
                     predictor.classify("hello")
                 assert predictor.router is None
                 assert predictor.router_error is not None
+                with pytest.raises(RuntimeError):
+                    predictor.classify("hello again")
+                download.assert_called_once()
 
     @patch("sentimentizer.predictor.get_trained_model")
     @patch("sentimentizer.predictor.get_trained_tokenizer")

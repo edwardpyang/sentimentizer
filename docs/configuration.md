@@ -175,6 +175,21 @@ section each for `krea_2` and `ideogram_4`.
 | `SENTIMENTIZER_AUGMENT_VARIATIONS_PER_SEED` | `variations_per_seed` | augmentation | int |
 | `SENTIMENTIZER_AUGMENT_OUTPUT_PATH` | `output_path` | augmentation | str |
 | `SENTIMENTIZER_AUGMENT_BATCH_SIZE` | `batch_size` | augmentation | int |
+| `SENTIMENTIZER_AUGMENT_SEED_PATH` | `seed_path` | augmentation | str (path) |
+
+`RouterConfig.task` is a `RouterTaskSpec` loaded from `training.task` in YAML.
+It records `task_id`, `taxonomy_version` (default `"1"`), `description`, ordered
+`labels`, optional `label_descriptions`, optional `fallback_label`, and
+`input_format` (default `"text-v1"`). Labels must be unique, nonempty strings
+with at least two classes; description and fallback references must belong to
+the vocabulary. Older YAML without a task section retains the food defaults.
+Training saves the task spec with the model; inference uses that artifact
+metadata rather than the current training YAML.
+
+`augmentation.seed_path` defaults to `""`, which selects bundled food seeds
+only for the default task. A custom task requires an explicit JSONL seed file
+for augmentation; relative paths resolve against the config file's directory.
+See the [external config example](router.md#reuse-with-external-configurations).
 
 ### Loading order in callers
 

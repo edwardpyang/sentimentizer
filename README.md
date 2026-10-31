@@ -73,6 +73,55 @@ Models output **3-class probabilities** (negative, neutral, positive) that sum t
 
 ---
 
+## Intent Router API
+
+The intent router classifies reviews as `dietary`, `service`, or `general`.
+It uses a SentenceTransformer backbone and LogisticRegression head; the former
+SetFit implementation has been replaced. Install serving and router support
+with `uv add "sentimentizer[ray,router]"`, then start the API with
+`sentimentizer serve`. The router loads on the first classification request.
+
+| Method | Endpoint | Response model |
+| --- | --- | --- |
+| POST | `/v1/router/predict` | `RouterPredictResponse`: `prediction`, `latency_s` |
+| POST | `/v1/router/batch` | `RouterBatchResponse`: `results`, `count`, `latency_s` |
+| GET | `/v1/router/models` | `RouterModelsResponse`: `model_path`, `categories`, `status`, `error` |
+
+For example, send `{"text": "They were so careful with my celiac needs"}` to
+`/v1/router/predict`. The JSON response has this shape (scores and latency are
+illustrative):
+
+```json
+{
+  "prediction": {
+    "label": "dietary",
+    "score": 0.95,
+    "token_count": 8
+  },
+  "latency_s": 0.0031
+}
+```
+
+Batch requests accept `{"texts": ["Great service", "Delicious pizza"]}`;
+each entry in `results` uses the same `{"prediction": {...}}` envelope.
+`score` represents the predicted category's probability, `token_count` counts
+regex tokens, and `latency_s` measures server-side handler time in seconds.
+HTTP envelopes live in `sentimentizer/serve/models.py`; shared task and
+classification schemas live in `sentimentizer/router/schemas.py`.
+
+See the [complete JSON examples and validation rules](docs/serving.md#router-review-categorization-endpoints)
+and the [router guide](docs/router.md#python-and-http-response-contract).
+Responses validate finite scores in `[0, 1]`, nonnegative counts/timing, and
+complete batches. Confidence columns follow the classifier's saved class order.
+
+The router uses task configuration and artifact-defined labels while retaining
+food-review defaults. To train another task, supply an external YAML config,
+its labeled data, and optional augmentation seeds. Each trained artifact saves
+its task definition; changing YAML alone does not retrain existing weights.
+See [reuse with external configurations](docs/router.md#reuse-with-external-configurations).
+
+---
+
 ## Image Generation (Krea 2 / Ideogram 4)
 
 Image generation uses a separately managed, headless ComfyUI process. Torch
@@ -236,7 +285,7 @@ Detailed guides and implementation details are available in the specialized docu
 - 🎛️ **[Hyperparameter Tuning Guide](docs/tuning.md)**: Optuna searches, LangGraph iterative agent tuning (via Ollama GLM 5.1), and validation/retries.
 - 🔗 **[Hugging Face Hub Integration](docs/huggingface.md)**: Pre-trained weights synchronization, explicit pull/push, and auto-generated model cards.
 - 📈 **[Metrics and Monitoring Pipeline](docs/metrics.md)**: Exporter details, Grafana dashboards, Prometheus scrape targets, NaN handling, and real-time intra-epoch batch metrics.
-- 🧭 **[SetFit Review Router](docs/router.md)**: Utterance classification categories (Dietary/Service/General), Ollama GLM 5.1 augmentation, training, and evaluation.
+- 🧭 **[Intent Review Router](docs/router.md)**: Dietary/service/general classification, Python and JSON response contracts, Ollama GLM 5.1 augmentation, training, and evaluation.
 - 🛠️ **[Troubleshooting Guide](docs/troubleshooting.md)**: Solutions for common issues like majority-class collapses, vocabulary matches, or scheduling.
 
 ---
@@ -344,13 +393,15 @@ sentimentizer/
 │   ├── nodes.py          # LangGraph node functions (analyze, decide, tune, evaluate)
 │   ├── graph.py          # LangGraph StateGraph + run_agent_tuning() entry point
 │   └── diagnose_model.py # TuningRun workflow (tune → train → validate → retry pipeline)
-├── router/                # SetFit router module
+├── router/                # SentenceTransformer + LogisticRegression intent router
 │   ├── __init__.py       # Package exports
-│   ├── config.py         # SetFitConfig, RouteLabels, AugmentConfig
+│   ├── config.py         # RouterConfig (SetFitConfig alias), food defaults, AugmentConfig
+│   ├── schemas.py        # RouterTaskSpec, RouterClassification, artifact metadata
+│   ├── model.py          # RouterModel inference, save/load, legacy artifact migration
 │   ├── seeds.py          # Golden example utterances per category
 │   ├── augment.py        # GLM 5.1 augmentation via Ollama
 │   ├── dataset.py        # JSONL dataset loader, train/test split
-│   ├── train_router.py   # SetFit training with compat shims
+│   ├── train_router.py   # Contrastive backbone fine-tuning + classifier head fitting
 │   └── evaluate.py       # Similarity heatmap, threshold calibration
 └── models/
     ├── __init__.py

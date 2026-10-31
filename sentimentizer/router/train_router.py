@@ -1,4 +1,4 @@
-"""Train the router model for Yelp review categorization.
+"""Train a task-configured router with food-review defaults.
 
 Uses CosineSimilarityLoss for contrastive learning on the embedding
 space, then fits a LogisticRegression classification head on top of
@@ -21,7 +21,7 @@ from sentence_transformers.sentence_transformer.losses import CosineSimilarityLo
 from sklearn.linear_model import LogisticRegression
 from torch.utils.data import DataLoader
 
-from sentimentizer.router.config import RouteLabels, RouterConfig
+from sentimentizer.router.config import RouterConfig
 from sentimentizer.router.model import RouterModel
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,8 @@ def generate_contrastive_pairs(
         texts_by_label.setdefault(label, []).append(text)
 
     unique_labels = list(texts_by_label.keys())
+    if len(unique_labels) < 2:
+        raise ValueError("Contrastive training requires at least two classes")
     pairs: list[InputExample] = []
 
     for text, label in zip(texts, labels, strict=True):
@@ -120,17 +122,25 @@ def train_router(
             texts = texts.tolist() if not isinstance(texts, list) else list(texts)
         if hasattr(labels, "tolist"):
             labels = labels.tolist() if not isinstance(labels, list) else list(labels)
-        # Ensure strings
-        texts = [str(t) for t in texts]
-        labels = [int(lbl) for lbl in labels]
+        texts = list(texts)
+        labels = [config.task.label_id(lbl) for lbl in labels]
     else:
         raise ValueError(f"Unsupported train_dataset type: {type(train_dataset)}")
 
+    if len(texts) != len(labels) or any(
+        not isinstance(text, str) or not text.strip() for text in texts
+    ):
+        raise ValueError("Training requires one nonempty text per class ID")
+    if set(labels) != set(range(len(config.task.labels))):
+        raise ValueError("Training data must include every configured task class")
+    if config.max_seq_length <= 0:
+        raise ValueError("max_seq_length must be positive")
     logger.info(f"Training router model on {len(texts)} examples, {len(set(labels))} classes")
 
     # Step 1: Load backbone
     logger.info(f"Loading backbone: {config.base_model}")
     backbone = SentenceTransformer(config.base_model)
+    backbone.max_seq_length = config.max_seq_length
 
     # Step 2: Generate contrastive pairs
     pairs = generate_contrastive_pairs(
@@ -164,8 +174,7 @@ def train_router(
     head.fit(embeddings, labels)
 
     # Step 5: Build RouterModel
-    label_names = list(RouteLabels.label_names().values())
-    model = RouterModel(backbone=backbone, head=head, labels=label_names)
+    model = RouterModel(backbone=backbone, head=head, task=config.task)
 
     # Step 6: Save model
     output_path = Path(config.output_dir)

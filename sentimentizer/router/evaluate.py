@@ -1,180 +1,155 @@
-"""Evaluation utilities for the router model.
-
-Provides:
-- Cosine similarity matrix (inter-class < 0.65, intra-class > 0.85)
-- Tau threshold calibration (where False Positives appear in General category)
-- Full evaluation: accuracy, F1, similarity matrix, threshold
-"""
+"""Evaluate task-specific router labels and historical fallback thresholds."""
 
 from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import TYPE_CHECKING
+from numbers import Integral
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from sklearn.metrics import classification_report
 
-from sentimentizer.router.config import RouteLabels
+from sentimentizer.router.config import FOOD_TASK_SPEC
 
 if TYPE_CHECKING:
     from sentimentizer.router.model import RouterModel
+    from sentimentizer.router.schemas import RouterClassification
 
 logger = logging.getLogger(__name__)
 
-LABEL_NAMES = RouteLabels.label_names()
+
+def _label_names(model: RouterModel) -> dict[int, str]:
+    """Read the saved vocabulary, including legacy string-class heads."""
+    labels = list(model.task.labels) if model.task is not None else model.labels
+    return dict(enumerate(labels or model.class_labels()))
+
+
+def _target_names(values: list, label_names: dict[int, str]) -> list[str]:
+    """Resolve evaluation targets without silently coercing invalid IDs."""
+    names = []
+    for value in values:
+        if isinstance(value, str) and value in label_names.values():
+            names.append(value)
+        elif isinstance(value, Integral) and not isinstance(value, bool) and value in label_names:
+            names.append(label_names[int(value)])
+        else:
+            raise ValueError("Evaluation label is outside the artifact vocabulary")
+    return names
+
+
+def _fallback_label(model: RouterModel) -> str | None:
+    """Keep the historical food fallback only for identifiable food artifacts."""
+    if model.task is not None:
+        return model.task.fallback_label
+    return FOOD_TASK_SPEC.fallback_label if tuple(model.labels) == FOOD_TASK_SPEC.labels else None
 
 
 def compute_similarity_matrix(
     model: RouterModel, texts_by_label: dict[int, list[str]]
 ) -> np.ndarray:
-    """Generate inter-class and intra-class cosine similarity heatmap.
+    """Compute centroid cosine similarities for the observed classes.
 
-    Targets: inter-class similarity < 0.65, intra-class similarity > 0.85.
-
-    Args:
-        model: Trained RouterModel.
-        texts_by_label: Dict mapping label int to list of example texts.
-
-    Returns:
-        Cosine similarity matrix of shape (num_classes, num_classes).
+    The diagonal is centroid self-similarity, not an intra-class quality metric.
     """
-    # Encode all texts and compute centroids
-    centroids = {}
-    for label, texts in texts_by_label.items():
-        embeddings = model.model_encode(texts)  # (N, D)
-        centroids[label] = np.mean(embeddings, axis=0)
-
-    # Compute pairwise cosine similarity between centroids
-    labels = sorted(centroids.keys())
-    num_classes = len(labels)
-    sim_matrix = np.zeros((num_classes, num_classes))
-
-    for i, label_i in enumerate(labels):
-        for j, label_j in enumerate(labels):
-            vec_i = centroids[label_i]
-            vec_j = centroids[label_j]
-            dot = np.dot(vec_i, vec_j)
-            norm = np.linalg.norm(vec_i) * np.linalg.norm(vec_j)
-            sim_matrix[i, j] = dot / norm if norm > 0 else 0.0
-
-    # Log results
-    for i, label_i in enumerate(labels):
-        for j, label_j in enumerate(labels):
+    label_names = _label_names(model)
+    labels = sorted(texts_by_label)
+    centroids = [np.mean(model.model_encode(texts_by_label[label]), axis=0) for label in labels]
+    matrix = np.zeros((len(labels), len(labels)))
+    for i, first in enumerate(centroids):
+        for j, second in enumerate(centroids):
+            norm = np.linalg.norm(first) * np.linalg.norm(second)
+            matrix[i, j] = np.dot(first, second) / norm if norm > 0 else 0.0
             if i < j:
-                inter_sim = sim_matrix[i, j]
-                name_i = LABEL_NAMES.get(label_i, str(label_i))
-                name_j = LABEL_NAMES.get(label_j, str(label_j))
-                status = "OK" if inter_sim < 0.65 else "HIGH"
                 logger.info(
-                    f"Inter-class similarity ({name_i} vs {name_j}): {inter_sim:.4f} [{status}]"
+                    "Router centroid similarity",
+                    extra={
+                        "first_label": label_names[labels[i]],
+                        "second_label": label_names[labels[j]],
+                        "similarity": float(matrix[i, j]),
+                    },
                 )
+    return matrix
 
-    for label in labels:
-        name = LABEL_NAMES.get(label, str(label))
-        intra_sim = sim_matrix[label, label]
-        status = "OK" if intra_sim > 0.85 else "LOW"
-        logger.info(f"Intra-class similarity ({name}): {intra_sim:.4f} [{status}]")
 
-    return sim_matrix
+def _threshold_recommendation(
+    predictions: list[RouterClassification], targets: list[str], fallback_label: str | None
+) -> float | None:
+    """Compute the legacy heuristic, which is not a calibrated acceptance policy."""
+    if fallback_label is None:
+        return None
+    correct = []
+    fallback_errors = []
+    for prediction, target in zip(predictions, targets, strict=True):
+        if prediction.label == target:
+            correct.append(prediction.score)
+        elif prediction.label == fallback_label:
+            fallback_errors.append(prediction.score)
+    if not correct:
+        logger.warning("No correct predictions for historical threshold recommendation")
+        return None
+    threshold = min(correct)
+    if fallback_errors:
+        threshold = (threshold + max(fallback_errors)) / 2
+    return float(threshold)
 
 
 def calibrate_threshold(
-    model: RouterModel, eval_dataset: dict, label_names: dict[int, str] | None = None
-) -> float:
-    """Find tau threshold where False Positives appear in General category.
-
-    The tau threshold is the confidence score below which the router
-    should fall back to a default handling strategy.
-
-    Args:
-        model: Trained RouterModel.
-        eval_dataset: Evaluation dataset with 'text' and 'label' columns.
-        label_names: Optional mapping from label int to name.
-
-    Returns:
-        Recommended tau threshold (confidence score).
-    """
-    if label_names is None:
-        label_names = LABEL_NAMES
-
-    texts = eval_dataset["text"]
-    true_labels = eval_dataset["label"]
-
-    probs = model.predict_proba(texts)
-    preds = model.predict(texts)
-
-    correct_confidences = []
-    general_fp_confidences = []
-    general_label = [k for k, v in label_names.items() if v == "general"][0]
-
-    for _i, (pred, true, prob_vec) in enumerate(zip(preds, true_labels, probs, strict=True)):
-        confidence = max(prob_vec)
-        if pred == true:
-            correct_confidences.append(confidence)
-        elif pred == general_label and true != general_label:
-            general_fp_confidences.append(confidence)
-
-    if not correct_confidences:
-        logger.warning("No correct predictions found for threshold calibration")
-        return 0.5
-
-    tau = min(correct_confidences)
-    if general_fp_confidences:
-        worst_correct = min(correct_confidences)
-        best_fp = max(general_fp_confidences)
-        tau = (worst_correct + best_fp) / 2
-
-    logger.info(f"Calibrated tau threshold: {tau:.4f}")
-    logger.info(
-        f"  Correct predictions: min_conf={min(correct_confidences):.4f}, "
-        f"max_conf={max(correct_confidences):.4f}"
-    )
-    if general_fp_confidences:
-        logger.info(
-            f"  General false positives: min_conf={min(general_fp_confidences):.4f}, "
-            f"max_conf={max(general_fp_confidences):.4f}"
-        )
-
-    return float(tau)
+    model: RouterModel,
+    eval_dataset: Any,
+    label_names: dict[int, str] | None = None,
+    *,
+    fallback_label: str | None = None,
+) -> float | None:
+    """Return a historical fallback heuristic, or None for tasks without one."""
+    label_names = _label_names(model) if label_names is None else label_names
+    if label_names != _label_names(model):
+        raise ValueError("Evaluation label names conflict with the artifact vocabulary")
+    fallback_label = _fallback_label(model) if fallback_label is None else fallback_label
+    if fallback_label is not None and fallback_label not in label_names.values():
+        raise ValueError("Fallback label is outside the artifact vocabulary")
+    if fallback_label is None:
+        return None
+    targets = _target_names(list(eval_dataset["label"]), label_names)
+    predictions = model.classify_batch(list(eval_dataset["text"]))
+    return _threshold_recommendation(predictions, targets, fallback_label)
 
 
 def evaluate_router(
-    model: RouterModel, eval_dataset: dict, label_names: dict[int, str] | None = None
+    model: RouterModel, eval_dataset: Any, label_names: dict[int, str] | None = None
 ) -> dict:
-    """Full evaluation: accuracy, F1, similarity matrix, threshold.
-
-    Args:
-        model: Trained RouterModel.
-        eval_dataset: Evaluation dataset with 'text' and 'label' columns.
-        label_names: Optional mapping from label int to name.
-
-    Returns:
-        Dict with 'classification_report', 'similarity_matrix', 'tau_threshold'.
-    """
-    if label_names is None:
-        label_names = LABEL_NAMES
-
-    texts = eval_dataset["text"]
-    true_labels = eval_dataset["label"]
-    preds = model.predict(texts)
-
-    target_names = [label_names.get(i, str(i)) for i in sorted(label_names.keys())]
-    report = classification_report(true_labels, preds, target_names=target_names, output_dict=True)
-    logger.info(
-        f"Classification report:\n"
-        f"{classification_report(true_labels, preds, target_names=target_names)}"
+    """Report all configured classes, observed centroids, and confidence statistics."""
+    label_names = _label_names(model) if label_names is None else label_names
+    if label_names != _label_names(model):
+        raise ValueError("Evaluation label names conflict with the artifact vocabulary")
+    texts = list(eval_dataset["text"])
+    targets = _target_names(list(eval_dataset["label"]), label_names)
+    if not texts or len(texts) != len(targets):
+        raise ValueError("Evaluation requires a nonempty, aligned text/label dataset")
+    predictions = model.classify_batch(texts)
+    predicted_labels = [prediction.label for prediction in predictions]
+    names = list(label_names.values())
+    report = classification_report(
+        targets,
+        predicted_labels,
+        labels=names,
+        target_names=names,
+        output_dict=True,
+        zero_division=0,
     )
-
+    logger.info("Router evaluation complete", extra={"examples": len(texts), "classes": len(names)})
     texts_by_label = defaultdict(list)
-    for text, label in zip(texts, true_labels, strict=True):
-        texts_by_label[label].append(text)
-    sim_matrix = compute_similarity_matrix(model, dict(texts_by_label))
-
-    tau = calibrate_threshold(model, eval_dataset, label_names)
-
+    for text, target in zip(texts, targets, strict=True):
+        texts_by_label[names.index(target)].append(text)
+    scores = [prediction.score for prediction in predictions]
     return {
         "classification_report": report,
-        "similarity_matrix": sim_matrix,
-        "tau_threshold": tau,
+        "similarity_matrix": compute_similarity_matrix(model, texts_by_label),
+        "similarity_labels": [label_names[label] for label in sorted(texts_by_label)],
+        "tau_threshold": _threshold_recommendation(predictions, targets, _fallback_label(model)),
+        "confidence_statistics": {
+            "min": min(scores),
+            "max": max(scores),
+            "mean": float(np.mean(scores)),
+        },
     }

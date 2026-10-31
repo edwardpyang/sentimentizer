@@ -12,7 +12,7 @@ This document describes how to deploy and interact with the unified Sentimentize
 > uv add "sentimentizer[ray]"
 > ```
 
-The `serve` command starts a Ray Serve application with FastAPI routing (featuring interactive Swagger docs at `/docs`). It loads the sentiment model (defaulting to the configuration in `service.yaml`) and the intent router at startup. Headless Krea 2 and Ideogram 4 generation can be enabled through a separate ComfyUI process. All public APIs share the Ray Serve port.
+The `serve` command starts a Ray Serve application with FastAPI routing (featuring interactive Swagger docs at `/docs`). It loads the sentiment model (defaulting to the configuration in `service.yaml`) at startup. The intent router loads lazily on the first classification request; metadata requests do not trigger loading. Headless Krea 2 and Ideogram 4 generation can be enabled through a separate ComfyUI process. All public APIs share the Ray Serve port.
 
 ### Starting the Server
 
@@ -191,7 +191,36 @@ Both the full and BGE-M3-only applications expose `/health/live`,
 
 ### Router (Review Categorization) Endpoints
 
+The router uses a SentenceTransformer backbone and LogisticRegression head.
+Its default categories are `dietary`, `service`, and `general`; custom artifacts
+provide their own vocabulary. Each route
+declares a Pydantic response model from `sentimentizer/serve/models.py`;
+FastAPI serializes responses as JSON objects. Example scores and timings below
+are illustrative.
+
+| Field | Meaning |
+| --- | --- |
+| `prediction.label` | Predicted route category; route categories are separate from sentiment labels. |
+| `prediction.score` | Finite probability assigned to the predicted category, between 0 and 1. |
+| `prediction.token_count` | Number of tokens from `regex_tokenize(text)`, rather than backbone subword tokens; can be zero. |
+| `latency_s` | Server-side handler duration in seconds, rounded to four decimal places; excludes client/network time. |
+| `results` | Batch prediction envelopes in input order, with exactly one result per input. |
+| `count` | Number of entries in `results`. |
+
+Prediction objects contain `label`, `score`, and `token_count`. They omit the
+input text, a `category` alias, the model name, and all-class probabilities.
+
+Handlers return Pydantic objects, with strict nonnegative integer counts,
+finite nonnegative latency, and no unexpected response fields. The shared
+classification schema lives in `router/schemas.py`; HTTP envelopes live in
+`serve/models.py`. Inference validates label membership against the loaded
+artifact's vocabulary, maps probabilities through `head.classes_`, and rejects
+malformed or partial batches. Validation occurs before success accounting.
+OpenAPI keeps the label type generic; use `/v1/router/models` to discover the
+loaded vocabulary. See [task configuration](router.md#reuse-with-external-configurations).
+
 #### Classify Single Review
+
 - **Route**: `POST /v1/router/predict`
 - **Request Body**:
   ```json
@@ -205,7 +234,7 @@ Both the full and BGE-M3-only applications expose `/health/live`,
     -H "Content-Type: application/json" \
     -d '{"text": "They were so careful with my celiac needs"}'
   ```
-- **Response**:
+- **Response** (`RouterPredictResponse`):
   ```json
   {
     "prediction": {
@@ -218,6 +247,7 @@ Both the full and BGE-M3-only applications expose `/health/live`,
   ```
 
 #### Classify Batch of Reviews
+
 - **Route**: `POST /v1/router/batch`
 - **Request Body**:
   ```json
@@ -231,13 +261,76 @@ Both the full and BGE-M3-only applications expose `/health/live`,
     -H "Content-Type: application/json" \
     -d '{"texts": ["Great gluten-free options!", "The waiter was rude", "Decent pizza"]}'
   ```
+- **Response** (`RouterBatchResponse`):
+  ```json
+  {
+    "results": [
+      {
+        "prediction": {
+          "label": "dietary",
+          "score": 0.95,
+          "token_count": 3
+        }
+      },
+      {
+        "prediction": {
+          "label": "service",
+          "score": 0.89,
+          "token_count": 4
+        }
+      },
+      {
+        "prediction": {
+          "label": "general",
+          "score": 0.91,
+          "token_count": 2
+        }
+      }
+    ],
+    "count": 3,
+    "latency_s": 0.0052
+  }
+  ```
 
 #### Router Model Metadata
+
 - **Route**: `GET /v1/router/models`
 - **Command**:
   ```bash
   curl http://localhost:8000/v1/router/models
   ```
+- **Declared response contract** (`RouterModelsResponse`):
+  ```json
+  {
+    "model_path": "models/router",
+    "categories": ["dietary", "service", "general"],
+    "status": "loaded",
+    "error": null,
+    "task_id": "food_reviews",
+    "taxonomy_version": "1"
+  }
+  ```
+
+`status` is currently produced as `loaded` or `not_loaded`. Before the first
+classification, it is `not_loaded` with no load error. A failed load is cached:
+status remains `not_loaded` and `error` contains the failure message. Metadata
+reads the local sidecar without loading or downloading weights. The example
+above describes a newly trained food artifact. Legacy artifacts may have null
+task/version fields. Unknown custom artifacts report empty categories and null
+task/version; the default food path can identify its food task before loading.
+Missing optional inference dependencies do not prevent local metadata inspection.
+The response model defaults `error` to `null` when the producer omits it.
+
+#### Router Errors
+
+Invalid request bodies retain Pydantic's HTTP 422 response shape. A failed
+router load during classification returns HTTP 503 through the standard
+`{"error": {"code": "service_unavailable", "message": "..."}}` envelope.
+Unhandled server failures return HTTP 500 with `code: "internal_error"` and a
+`request_id` inside `error`. Response validation failures are server errors;
+they are separate from request validation. Missing custom model paths never
+download the default food model. Correct the artifact or config and recreate
+the predictor/service to retry a cached loading failure.
 
 ---
 
