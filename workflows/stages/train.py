@@ -172,6 +172,28 @@ def _reset_stale_metrics(model_type: str, run_id: str = "") -> None:
         pass
 
 
+def validate_train_options(
+    state: State, *, distributed: bool, resume: bool, checkpoint_dir: str
+) -> None:
+    """Reject option combinations that would otherwise be silently ignored.
+
+    Without a checkpoint directory, resuming would quietly restart from scratch. Ray
+    workers build a fresh model in ``_train_func``, so neither a checkpoint nor existing
+    weights would be used. Call before extract/tokenize so the failure is immediate.
+    """
+    if resume and not distributed and not checkpoint_dir:
+        raise ValueError("Resuming requires --checkpoint-dir")
+    if not distributed:
+        return
+    if resume:
+        raise ValueError("Resuming is not supported with --distributed; train without --resume")
+    if state.run_type == "update":
+        raise ValueError(
+            "--run-type update is not supported with --distributed; "
+            "workers always build a new model"
+        )
+
+
 def run_train(
     state: State,
     *,
@@ -201,6 +223,10 @@ def run_train(
 ) -> None:
     """Fit the model (single-node or distributed)."""
     from sentimentizer.device import resolve_device
+
+    validate_train_options(
+        state, distributed=distributed, resume=resume, checkpoint_dir=checkpoint_dir
+    )
 
     # Validate that include_neutral and num_classes are consistent
     if include_neutral and num_classes != 3:
@@ -423,6 +449,9 @@ def _run_fit_single(
         _cuda_cleanup()
 
     if save:
+        from sentimentizer.trainer import restore_best_checkpoint
+
+        restore_best_checkpoint(model, checkpoint_dir, device=device)
         weights_path = weights_path_for(state.model)
         inner = model.module if hasattr(model, "module") else model
         if hasattr(inner, "save_to_checkpoint_dir"):
@@ -557,7 +586,7 @@ def _run_fit_distributed(
 
     # Publish final metrics from distributed training to the driver-level
     # Prometheus gauges so they are visible on the /metrics endpoint.
-    _publish_distributed_metrics(result, state.model)
+    _publish_distributed_metrics(result, state.model, cfg.run_id)
 
     logger.info(  # type: ignore[call-arg]
         "distributed training completed",
@@ -572,7 +601,10 @@ def _run_fit_distributed(
         import ray.cloudpickle as pickle
 
         weights_path = weights_path_for(state.model)
-        with result.checkpoint.as_directory() as checkpoint_dir_path:
+        best_checkpoint = (
+            result.get_best_checkpoint(metric="val_loss", mode="min") or result.checkpoint
+        )
+        with best_checkpoint.as_directory() as checkpoint_dir_path:
             with open(os.path.join(checkpoint_dir_path, "data.pkl"), "rb") as fp:
                 checkpoint_data = pickle.load(fp)
 
@@ -614,7 +646,7 @@ def _run_fit_distributed(
             )
 
 
-def _publish_distributed_metrics(result: Any, model_type: str) -> None:
+def _publish_distributed_metrics(result: Any, model_type: str, run_id: str = "") -> None:
     """Persist final distributed training metrics to the per-model JSON file.
 
     During distributed training, ``_train_func`` runs inside Ray workers that
@@ -637,10 +669,10 @@ def _publish_distributed_metrics(result: Any, model_type: str) -> None:
         train_loss=round(metrics.get("train_loss", 0), 4),
     )
 
-    _persist_metrics_to_file(result.metrics, model_type)
+    _persist_metrics_to_file(result.metrics, model_type, run_id)
 
 
-def _persist_metrics_to_file(metrics: dict, model_type: str) -> None:
+def _persist_metrics_to_file(metrics: dict, model_type: str, run_id: str = "") -> None:
     """Write final training metrics to a per-model JSON file for the standalone exporter.
 
     Each model type writes to its own file
@@ -689,6 +721,7 @@ def _persist_metrics_to_file(metrics: dict, model_type: str) -> None:
         "neutral_avg_precision": _opt_float("neutral_avg_precision", "val_neutral_avg_precision"),
         "epoch": int(metrics.get("epoch", 0)),
         "lr": float(metrics.get("lr", 0.0)),
+        "run_id": run_id,
         "_written_by": model_type,
         "_written_at": __import__("time").time(),
     }

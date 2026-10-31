@@ -345,7 +345,7 @@ class TuningRun:
             model_weights_path = Path(weights_path_for(self.config.model_type))
             try:
                 model_weights_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(result.model_path, model_weights_path)
+                _publish_tuned_weights(Path(result.model_path), model_weights_path)
                 logger.info(
                     "weights_copied_to_default",
                     source=result.model_path,
@@ -573,7 +573,7 @@ class TuningRun:
         import torch
 
         from sentimentizer.loader import load_train_val_corpus_datasets
-        from sentimentizer.trainer import new_trainer
+        from sentimentizer.trainer import new_trainer, restore_best_checkpoint
 
         model_type = self.config.model_type
         device = self.config.device
@@ -600,6 +600,7 @@ class TuningRun:
 
         trainer_config = TrainerConfig(
             epochs=final_epochs,
+            batch_size=best_config.get("batch_size", TrainerConfig.batch_size),
             device=device,
             early_stopping_patience=3,
             checkpoint_dir=str(self._output_dir / "checkpoints"),
@@ -617,6 +618,8 @@ class TuningRun:
             model=model,
             cfg=trainer_config,
             model_type=model_type,
+            lr=best_config.get("lr"),
+            weight_decay=best_config.get("weight_decay"),
         )
 
         # Load data
@@ -628,6 +631,7 @@ class TuningRun:
 
         # Train
         trainer.fit(model, train_data=train_dataset, val_data=val_dataset)
+        restore_best_checkpoint(model, trainer_config.checkpoint_dir, device=device)
 
         # Save model weights
         model_path = self._output_dir / f"best_model_{model_type}.pth"
@@ -1280,6 +1284,25 @@ def _create_model(model_type: str, model_config: Any) -> Any:
         )
     else:
         raise ValueError(f"Unknown model type: {model_type}")
+
+
+def _publish_tuned_weights(source: Path, destination: Path) -> None:
+    """Write tuned weights to the serving path with their architecture embedded.
+
+    Serving and Hub consumers only receive the weights file, so a sidecar next to the
+    tuning output would not reach them, and non-default architectures would fail to
+    load or, for ``n_heads``, load silently wrong.
+    """
+    import torch
+
+    config_path = source.with_name(f"{source.stem}_config.json")
+    if not config_path.exists():
+        shutil.copy2(source, destination)
+        return
+    with open(config_path) as f:
+        model_config = json.load(f)
+    state_dict = torch.load(source, map_location="cpu", weights_only=True)
+    torch.save({"model_state_dict": state_dict, "model_config": model_config}, destination)
 
 
 def _load_trained_model(model_type: str, model_path: str, device: str) -> Any:

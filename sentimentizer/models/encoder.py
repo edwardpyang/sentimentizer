@@ -15,7 +15,7 @@ from sentimentizer.config import (
     weights_path_for,
 )
 from sentimentizer.extractor import new_embedding_weights
-from sentimentizer.models.base import BaseSentimentModel
+from sentimentizer.models.base import BaseSentimentModel, unpack_saved_weights
 
 logger = new_logger(DEFAULT_LOG_LEVEL)
 
@@ -283,6 +283,7 @@ def get_trained_model(
         map_location=torch.device(device=device),
         weights_only=True,
     )
+    weights, model_config = unpack_saved_weights(weights, model_config)
 
     # Infer vocab size and d_model from saved weights
     emb_shape = weights["embed_layer.weight"].shape

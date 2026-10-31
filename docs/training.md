@@ -90,7 +90,10 @@ Model checkpointing is enabled by default during training to protect against sys
 
 Checkpoints are saved inside the `checkpoints/<model_type>/` directory:
 - `checkpoint_epoch_<epoch>.pth`: Periodic checkpoint saved at the end of each epoch (frequency controlled by `--checkpoint-every`).
-- `best_model.pth`: Saved whenever the validation loss improves (controlled by `--checkpoint-best`, which defaults to True).
+- `best_model.pth`: Saved whenever the validation loss improves. `--save` writes these best weights rather than the final epoch's; without a checkpoint directory it falls back to the final epoch.
+- `checkpoint_epoch_<epoch>/` and `best_model/`: Per-checkpoint `backbone/` for ModernBERT, about one full model per retained checkpoint. GloVe models keep everything in the `.pth`.
+
+Epochs are ordered numerically when finding the latest checkpoint. Distributed runs store Ray checkpoints in `--checkpoint-dir` (or Ray's default location) every epoch, keeping the best by validation loss and the latest; `--checkpoint-every` does not apply to them.
 
 A checkpoint file contains a dictionary of:
 - `model_state_dict`: Model weights.
@@ -104,11 +107,11 @@ A checkpoint file contains a dictionary of:
 
 - **Save Checkpoint Every N Epochs**: `--checkpoint-every N` (default: 1)
 - **Disable Checkpoints / Saving**: `--no-save` (disables all checkpoint saving and weight persistence)
-- **Resume Training**: `--resume` (or `--resume-train` inside `sentimentizer run`) resumes training from the latest checkpoint found in the checkpoint directory.
+- **Resume Training**: `--resume` (or `--resume-train` inside `sentimentizer run`) resumes training from the latest checkpoint found in the checkpoint directory. It requires `--checkpoint-dir` and is not supported with `--distributed`, which also rejects `--run-type update`.
 
 *Example (Resuming training):*
 ```bash
-sentimentizer train --resume --save
+sentimentizer train --resume --checkpoint-dir checkpoints/rnn --save
 ```
 
 ---

@@ -201,7 +201,10 @@ def test_run_passes_resume_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("workflows.stages.tokenize.run_tokenize", mock_tokenize)
     monkeypatch.setattr("workflows.stages.train.run_train", mock_train)
 
-    result = CliRunner().invoke(cli, ["run", "--stop", "10", "--resume-tokenize", "--resume-train"])
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--stop", "10", "--resume-tokenize", "--resume-train", "--checkpoint-dir", "ckpt"],
+    )
     assert result.exit_code == 0, result.output
     assert tokenize_kwargs["resume"] is True
     assert train_kwargs["resume"] is True
