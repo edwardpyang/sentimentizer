@@ -339,7 +339,10 @@ def router() -> None:
 
 
 @router.command("train")
-@click.option("--data", type=click.Path(exists=True), help="Path to augmented JSONL data")
+@click.option("--data", required=True, type=click.Path(exists=True), help="Training JSONL data")
+@click.option(
+    "--validation-data", type=click.Path(exists=True), help="Independent validation JSONL"
+)
 @click.option(
     "--base-model",
     default=None,
@@ -357,6 +360,7 @@ def router() -> None:
 def router_train(
     ctx: click.Context,
     data: str,
+    validation_data: str | None,
     base_model: str | None,
     output_dir: str | None,
     config_path: str | None,
@@ -366,7 +370,11 @@ def router_train(
     from pathlib import Path
 
     from sentimentizer.router.config import load_router_config
-    from sentimentizer.router.dataset import load_router_dataset
+    from sentimentizer.router.dataset import (
+        assert_disjoint,
+        load_router_dataset,
+        load_router_records,
+    )
     from sentimentizer.router.train_router import train_router
 
     train_cfg, _ = load_router_config(config_path)
@@ -375,11 +383,59 @@ def router_train(
         base_model=base_model or train_cfg.base_model,
         output_dir=Path(output_dir) if output_dir else train_cfg.output_dir,
     )
-    train_ds, eval_ds = load_router_dataset(data, seed=config.seed)
+    if validation_data:
+        from datasets import Dataset
+
+        train_rows, eval_rows = load_router_records(data), load_router_records(validation_data)
+        assert_disjoint(train_rows, eval_rows)
+        train_ds, eval_ds = Dataset.from_list(train_rows), Dataset.from_list(eval_rows)
+    else:
+        train_ds, eval_ds = load_router_dataset(data, seed=config.seed)
     train_router(config, train_ds, eval_ds)
 
 
+@router.command("split")
+@click.option("--data", required=True, type=click.Path(exists=True))
+@click.option("--output-dir", required=True, type=click.Path())
+@click.option(
+    "--test-size", default=0.2, type=click.FloatRange(min=0, max=1, min_open=True, max_open=True)
+)
+@click.option(
+    "--validation-size",
+    default=0.2,
+    type=click.FloatRange(min=0, max=1, min_open=True, max_open=True),
+)
+@click.option("--seed", default=42, type=int)
+def router_split(
+    data: str, output_dir: str, test_size: float, validation_size: float, seed: int
+) -> None:
+    """Split original sources BEFORE augmenting the training partition."""
+    from pathlib import Path
+
+    from sentimentizer.router.dataset import (
+        assert_disjoint,
+        load_router_records,
+        save_dataset_to_jsonl,
+        split_router_records,
+    )
+
+    if test_size + validation_size >= 1:
+        raise click.UsageError("test-size + validation-size must be less than one")
+    train, test = split_router_records(load_router_records(data), test_size, seed)
+    train, validation = split_router_records(train, validation_size / (1 - test_size), seed)
+    assert_disjoint(train, validation, test)
+    for name, rows in (("train", train), ("validation", validation), ("test", test)):
+        save_dataset_to_jsonl(rows, str(Path(output_dir) / f"{name}.jsonl"))
+        click.echo(f"{name}: {len(rows)} records")
+
+
 @router.command("augment")
+@click.option(
+    "--seeds",
+    "seed_path_override",
+    type=click.Path(exists=True),
+    help="Training partition JSONL; overrides seed_path",
+)
 @click.option(
     "--output",
     default=None,
@@ -404,7 +460,7 @@ def router_train(
 @click.option(
     "--resume",
     is_flag=True,
-    help="Resume from existing output file, skipping already-processed seeds",
+    help="Resume missing variations using persisted seed lineage and counts",
 )
 @click.option(
     "--config",
@@ -416,6 +472,7 @@ def router_train(
 @click.pass_context
 def router_augment(
     ctx: click.Context,
+    seed_path_override: str | None,
     output: str | None,
     model: str | None,
     variations: int | None,
@@ -429,21 +486,19 @@ def router_augment(
     so you can see progress in real-time. Defaults come from
     router/config.yaml; CLI flags override when provided.
 
-    Use --resume to continue an interrupted augmentation: seeds that
-    already appear in the output file are skipped, and new entries are
-    appended to the existing file.
+    Use --resume to retry missing variations for incomplete seeds.
     """
     from pathlib import Path
 
-    from sentimentizer.router.augment import augment_seeds
+    from sentimentizer.router.augment import augment_seeds, augmentation_counts, prepare_seeds
     from sentimentizer.router.config import FOOD_TASK_SPEC, load_router_config
     from sentimentizer.router.dataset import load_router_records
     from sentimentizer.router.seeds import SEED_UTTERANCES
 
     train_cfg, augment_cfg = load_router_config(config_path)
-    if augment_cfg.seed_path:
-        seed_path = Path(augment_cfg.seed_path)
-        if config_path and not seed_path.is_absolute():
+    if seed_path_override or augment_cfg.seed_path:
+        seed_path = Path(seed_path_override or augment_cfg.seed_path)
+        if not seed_path_override and config_path and not seed_path.is_absolute():
             seed_path = Path(config_path).parent / seed_path
         seeds = load_router_records(seed_path)
     elif train_cfg.task == FOOD_TASK_SPEC:
@@ -452,7 +507,7 @@ def router_augment(
         raise click.UsageError("Custom tasks require augmentation.seed_path")
     effective_model = model or augment_cfg.model
     effective_url = ollama_url or augment_cfg.ollama_url
-    effective_variations = variations or augment_cfg.variations_per_seed
+    effective_variations = variations if variations is not None else augment_cfg.variations_per_seed
     effective_output = output or augment_cfg.output_path
 
     if resume:
@@ -469,6 +524,15 @@ def router_augment(
         resume=resume,
         task=train_cfg.task,
     )
+    counts = augmentation_counts(augmented)
+    incomplete = sum(
+        counts.get(seed["seed_id"], 0) < effective_variations
+        for seed in prepare_seeds(seeds, train_cfg.task)
+    )
+    if incomplete:
+        raise click.ClickException(
+            f"{incomplete} seeds incomplete; partial output saved. Retry with --resume"
+        )
     click.echo(f"Done: {len(augmented)} total utterances written to {effective_output}")
 
 

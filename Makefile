@@ -165,20 +165,31 @@ tune-no-validate:
 # Router
 # ──────────────────────────────────────────────
 
-## Augment router seed utterances with GLM 5.1 (requires Ollama)
+ROUTER_RAW_DATA ?= data/router/reviews.jsonl
+ROUTER_DATA_DIR ?= data/router/split
+
+## Split original labeled sources before augmentation
+router-split:
+	uv run sentimentizer router split --data $(ROUTER_RAW_DATA) --output-dir $(ROUTER_DATA_DIR)
+
+## Augment only the training sources (requires Ollama)
 router-augment:
-	uv run sentimentizer router augment --output augmented_yelp.jsonl
+	uv run sentimentizer router augment --seeds $(ROUTER_DATA_DIR)/train.jsonl --output $(ROUTER_DATA_DIR)/train.augmented.jsonl
 
 ## Train the SetFit router model
 router-train:
-	uv run sentimentizer router train --data augmented_yelp.jsonl
+	uv run sentimentizer router train --data $(ROUTER_DATA_DIR)/train.augmented.jsonl --validation-data $(ROUTER_DATA_DIR)/validation.jsonl
 
 ## Evaluate the SetFit router model
 router-evaluate:
-	uv run sentimentizer router evaluate --model-path models/router --data augmented_yelp.jsonl
+	uv run sentimentizer router evaluate --model-path models/router --data $(ROUTER_DATA_DIR)/test.jsonl
 
 ## Run the full router pipeline (augment -> train -> evaluate)
-router-pipeline: router-augment router-train router-evaluate
+router-pipeline:
+	$(MAKE) router-split
+	$(MAKE) router-augment
+	$(MAKE) router-train
+	$(MAKE) router-evaluate
 
 # ──────────────────────────────────────────────
 # Hugging Face Hub (push/pull per model)

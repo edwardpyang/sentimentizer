@@ -161,11 +161,7 @@ class TestDatasetLoader:
         """Test that loaded dataset has 'text' and 'label' columns."""
         from sentimentizer.router.dataset import load_router_dataset
 
-        data = [
-            {"text": "Dietary review", "label": 0},
-            {"text": "Service review", "label": 1},
-            {"text": "General review", "label": 2},
-        ] * 10  # Need enough for train/test split
+        data = [{"text": f"Independent review {i}", "label": i % 3} for i in range(30)]
 
         jsonl_path = tmp_path / "test_columns.jsonl"
         with open(jsonl_path, "w") as f:
@@ -287,7 +283,7 @@ class TestAugmentSeeds:
         )
         # Should still return the original seeds even if API fails
         assert len(result) >= len(seeds)
-        assert result[0] == seeds[0]
+        assert result[0]["text"] == seeds[0]["text"]
 
     def test_augment_seeds_streams_to_file(self, tmp_path) -> None:
         """Augment seeds with output_path should stream entries to JSONL."""
@@ -324,7 +320,7 @@ class TestAugmentSeeds:
             variations_per_seed=5,
         )
         assert len(result) >= len(seeds)
-        assert result[0] == seeds[0]
+        assert result[0]["text"] == seeds[0]["text"]
 
     def test_augment_seeds_resume_skips_existing(self, tmp_path) -> None:
         """Resume mode should skip seeds already in the output file."""
@@ -335,7 +331,6 @@ class TestAugmentSeeds:
         existing_entries = [
             {"text": "Seed 1", "label": 0},
             {"text": "Seed 2", "label": 1},
-            {"text": "Augmented 1", "label": 0},
         ]
         with open(output_path, "w") as f:
             for entry in existing_entries:
@@ -376,7 +371,7 @@ class TestAugmentSeeds:
             for seed in seeds:
                 f.write(json.dumps(seed) + "\n")
 
-        # Resume should detect all seeds are already processed
+        # Presence of originals alone is not completed augmentation.
         result = augment_seeds(
             seeds,
             ollama_url="http://localhost:99999/api/generate",
@@ -385,7 +380,7 @@ class TestAugmentSeeds:
             resume=True,
         )
 
-        # Should return the existing entries without making API calls
+        # Failed requests retain the original seeds for another resume.
         assert len(result) == 2
         assert result[0]["text"] == "Seed A"
         assert result[1]["text"] == "Seed B"
