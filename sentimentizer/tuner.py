@@ -160,13 +160,15 @@ class TunePrometheusCallback(TuneCallback):
             )
 
     # Ray Tune callback interface methods
+    # Ray dispatches these hooks by keyword (CallbackList.on_trial_*(**info)), so the
+    # parameter names are part of its interface and must not be renamed.
     def on_trial_result(
         self,
-        _iteration: int,
-        _trials: list,
+        iteration: int,
+        trials: list,
         trial: Any,
         result: dict,
-        **_kwargs: Any,
+        **info: Any,
     ) -> None:
         """Called after each trial reports intermediate results.
 
@@ -179,7 +181,7 @@ class TunePrometheusCallback(TuneCallback):
         )
         self._update_trial_gauges(trial_id, result)
 
-    def on_trial_complete(self, _iteration: int, trials: list, _trial: Any, **_kwargs: Any) -> None:
+    def on_trial_complete(self, iteration: int, trials: list, trial: Any, **info: Any) -> None:
         """Called when a trial completes."""
         self._completed_trials += 1
         try:
@@ -191,7 +193,7 @@ class TunePrometheusCallback(TuneCallback):
         except ImportError:
             pass
 
-    def on_trial_start(self, _iteration: int, trials: list, _trial: Any, **_kwargs: Any) -> None:
+    def on_trial_start(self, iteration: int, trials: list, trial: Any, **info: Any) -> None:
         """Called when a trial starts."""
         self._total_trials = len(trials) if trials else 0
         try:
@@ -338,14 +340,21 @@ def build_search_space(
 
 def _get_scheduler(
     tuner_config: TunerConfig,
+    max_epochs: int,
 ) -> ASHAScheduler | HyperBandScheduler | MedianStoppingRule:
-    """Create the appropriate Ray Tune scheduler from config."""
+    """Create the appropriate Ray Tune scheduler from config.
+
+    Args:
+        tuner_config: Tuner configuration.
+        max_epochs: Epochs per trial. Each trial reports once per epoch, so this is the
+            scheduler's ``max_t`` in its ``training_iteration`` unit.
+    """
     if tuner_config.scheduler == "asha":
         return ASHAScheduler(
             time_attr="training_iteration",
             metric=tuner_config.metric,
             mode=tuner_config.mode,
-            max_t=tuner_config.num_samples,
+            max_t=max_epochs,
             grace_period=tuner_config.grace_period,
             reduction_factor=tuner_config.reduction_factor,
         )
@@ -354,7 +363,7 @@ def _get_scheduler(
             time_attr="training_iteration",
             metric=tuner_config.metric,
             mode=tuner_config.mode,
-            max_t=tuner_config.num_samples,
+            max_t=max_epochs,
             reduction_factor=tuner_config.reduction_factor,
         )
     elif tuner_config.scheduler == "median":
@@ -432,8 +441,10 @@ def _trainable_wrapper(config: dict, train_dataset: Any = None, val_dataset: Any
         model_config=model_config,
     )
 
+    epochs = config.get("epochs", default_epochs(model_type))
     trainer_config = TrainerConfig(
-        epochs=config.get("epochs", 4),
+        epochs=epochs,
+        batch_size=config.get("batch_size", TrainerConfig.batch_size),
         device=device,
         dataloader_workers=0,
         class_weights=config.get("class_weights"),
@@ -447,6 +458,8 @@ def _trainable_wrapper(config: dict, train_dataset: Any = None, val_dataset: Any
         model=model,
         cfg=trainer_config,
         model_type=model_type,
+        lr=config.get("lr"),
+        weight_decay=config.get("weight_decay"),
     )
 
     if train_dataset is None or val_dataset is None:
@@ -466,21 +479,16 @@ def _trainable_wrapper(config: dict, train_dataset: Any = None, val_dataset: Any
         trainer_config,
     )
     model.to(device)
-
-    epochs = config.get("epochs", default_epochs(model_type))
-    best_val_loss = float("inf")
+    # Trainer.fit() normally does this; without it the placeholder decays to eta_min
+    # within the first few optimizer steps.
+    trainer.rebuild_scheduler(len(train_loader), epochs)
 
     for epoch in range(1, epochs + 1):
         trainer._train_epoch(model, train_loader, epoch)  # noqa: SLF001
         trainer.evaluate(model, val_loader, epoch)
 
-        from sentimentizer.metrics import compute_metrics_from_model
-
-        metrics = compute_metrics_from_model(model, val_loader, device)
+        metrics = trainer.latest_metrics
         val_loss = trainer.val_loss
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
 
         tune.report(
             {
@@ -624,7 +632,9 @@ def tune_model(
         random_state=balance_seed,
     )
 
-    scheduler = _get_scheduler(tuner_config)
+    from sentimentizer.config import default_epochs
+
+    scheduler = _get_scheduler(tuner_config, max_epochs=default_epochs(model_type))
     search_alg = OptunaSearch(
         metric=tuner_config.metric,
         mode=tuner_config.mode,

@@ -5,7 +5,7 @@
  	   upload-rnn upload-encoder upload-decoder upload-modernbert upload-router \
  	   download-rnn download-encoder download-decoder download-modernbert \
  	   push-hub pull-hub diagnose diagnose-env diagnose-pipeline \
- 	   router-augment router-train router-evaluate router-pipeline upload-router
+       router-split router-augment router-train router-evaluate router-pipeline upload-router
 
 # Default device: use auto-detect (cuda > mps > cpu)
 DEVICE ?= auto
@@ -94,10 +94,10 @@ train-no-checkpoint:
 
 ## Resume training from the latest checkpoint
 train-resume:
-	$(INHIBIT_SLEEP) uv run sentimentizer --model $(MODEL) --device $(DEVICE) --run-type $(RUN_TYPE) run --stop $(STOP) \
-		--checkpoint-dir $(CHECKPOINT_DIR) --resume-train --save
+	$(INHIBIT_SLEEP) uv run sentimentizer --model $(MODEL) --device $(DEVICE) --run-type $(RUN_TYPE) train \
+		--checkpoint-dir $(CHECKPOINT_DIR) --resume --save
 
-## Distributed training with Ray Train (2 workers by default)
+## Distributed training with Ray Train (1 worker; use train-dist-workers for more)
 train-distributed:
 	$(INHIBIT_SLEEP) uv run sentimentizer --model $(MODEL) --device $(DEVICE) --run-type $(RUN_TYPE) run --stop $(STOP) \
 		--distributed --checkpoint-dir $(CHECKPOINT_DIR) --checkpoint-every 1 --save
@@ -165,20 +165,31 @@ tune-no-validate:
 # Router
 # ──────────────────────────────────────────────
 
-## Augment router seed utterances with GLM 5.1 (requires Ollama)
+ROUTER_RAW_DATA ?= data/router/reviews.jsonl
+ROUTER_DATA_DIR ?= data/router/split
+
+## Split original labeled sources before augmentation
+router-split:
+	uv run sentimentizer router split --data $(ROUTER_RAW_DATA) --output-dir $(ROUTER_DATA_DIR)
+
+## Augment only the training sources (requires Ollama)
 router-augment:
-	uv run sentimentizer router augment --output augmented_yelp.jsonl
+	uv run sentimentizer router augment --seeds $(ROUTER_DATA_DIR)/train.jsonl --output $(ROUTER_DATA_DIR)/train.augmented.jsonl
 
-## Train the SetFit router model
+## Train the sentence encoder router
 router-train:
-	uv run sentimentizer router train --data augmented_yelp.jsonl
+	uv run sentimentizer router train --data $(ROUTER_DATA_DIR)/train.augmented.jsonl --validation-data $(ROUTER_DATA_DIR)/validation.jsonl
 
-## Evaluate the SetFit router model
+## Evaluate on independent held-out sources
 router-evaluate:
-	uv run sentimentizer router evaluate --model-path models/router --data augmented_yelp.jsonl
+	uv run sentimentizer router evaluate --model-path models/router --data $(ROUTER_DATA_DIR)/test.jsonl
 
 ## Run the full router pipeline (augment -> train -> evaluate)
-router-pipeline: router-augment router-train router-evaluate
+router-pipeline:
+	$(MAKE) router-split
+	$(MAKE) router-augment
+	$(MAKE) router-train
+	$(MAKE) router-evaluate
 
 # ──────────────────────────────────────────────
 # Hugging Face Hub (push/pull per model)

@@ -22,8 +22,11 @@ from typing import Any
 import numpy as np
 
 from sentimentizer.router.schemas import (
+    RouterAcceptancePolicy,
     RouterArtifactMetadata,
     RouterClassification,
+    RouterDecision,
+    RouterProvenance,
     RouterTaskSpec,
 )
 
@@ -32,6 +35,10 @@ logger = logging.getLogger(__name__)
 # Lazy imports — these are optional dependencies
 _sentence_transformers: Any = None
 _joblib: Any = None
+
+
+class RouterPolicyUnavailableError(RuntimeError):
+    """Signal that classification is available but calibrated decisions are not."""
 
 
 def _get_sentence_transformers() -> Any:
@@ -69,6 +76,8 @@ class RouterModel:
         labels: list[str] | None = None,
         *,
         task: RouterTaskSpec | None = None,
+        provenance: RouterProvenance | None = None,
+        acceptance_policy: RouterAcceptancePolicy | None = None,
     ) -> None:
         """Initialize RouterModel.
 
@@ -85,6 +94,8 @@ class RouterModel:
         metadata = RouterArtifactMetadata(labels=labels or [], task=task)
         self.task = metadata.task
         self.labels = list(metadata.labels)
+        self.provenance = provenance
+        self.acceptance_policy = acceptance_policy
 
     @staticmethod
     def read_metadata(path: str | Path) -> RouterArtifactMetadata | None:
@@ -153,7 +164,14 @@ class RouterModel:
             )
             return cls._migrate_legacy_setfit_model(path, backbone)
 
-        return cls(backbone=backbone, head=head, labels=metadata.labels, task=metadata.task)
+        return cls(
+            backbone=backbone,
+            head=head,
+            labels=metadata.labels,
+            task=metadata.task,
+            provenance=metadata.provenance,
+            acceptance_policy=metadata.acceptance_policy,
+        )
 
     @classmethod
     def _migrate_legacy_setfit_model(cls, path: Path, backbone: Any) -> RouterModel:
@@ -233,6 +251,8 @@ class RouterModel:
             labels=self.labels,
             head_type=type(self.head).__name__ if self.head is not None else None,
             task=self.task,
+            provenance=self.provenance,
+            acceptance_policy=self.acceptance_policy,
         )
         config_path = path / "router_config.json"
         # A metadata reader sees the old complete file or the new complete file.
@@ -307,6 +327,18 @@ class RouterModel:
         labels = self.class_labels()
         if not texts:
             return []
+        probabilities = self.probabilities_batch(texts)
+        winners = probabilities.argmax(axis=1)
+        return [
+            RouterClassification(label=labels[int(column)], score=float(row[column]))
+            for row, column in zip(probabilities, winners, strict=True)
+        ]
+
+    def probabilities_batch(self, texts: list[str]) -> np.ndarray:
+        """Validate probability dimensions, values and normalization in one pass."""
+        labels = self.class_labels()
+        if not texts:
+            return np.empty((0, len(labels)))
         probabilities = np.asarray(self.head.predict_proba(self.model_encode(texts)))
         if probabilities.dtype.kind not in "fiu":
             raise ValueError("Router probabilities must be numeric values, not booleans or strings")
@@ -318,10 +350,25 @@ class RouterModel:
             or (probabilities > 1).any()
         ):
             raise ValueError("Router probabilities must be finite and between zero and one")
-        winners = probabilities.argmax(axis=1)
+        if not np.allclose(probabilities.sum(axis=1), 1.0, rtol=1e-5, atol=1e-7):
+            raise ValueError("Router probability rows must sum to one")
+        return probabilities
+
+    def decide_batch(self, texts: list[str]) -> list[RouterDecision]:
+        """Apply the saved acceptance policy without changing the predicted label."""
+        if self.acceptance_policy is None:
+            raise RouterPolicyUnavailableError(
+                "Router has no acceptance policy; calibrate the artifact first"
+            )
+        threshold = self.acceptance_policy.threshold
         return [
-            RouterClassification(label=labels[int(column)], score=float(row[column]))
-            for row, column in zip(probabilities, winners, strict=True)
+            RouterDecision(
+                **prediction.model_dump(),
+                decision="accept"
+                if threshold is not None and prediction.score >= threshold
+                else "abstain",
+            )
+            for prediction in self.classify_batch(texts)
         ]
 
     def model_encode(self, texts: list[str] | str) -> np.ndarray:

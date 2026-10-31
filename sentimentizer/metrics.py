@@ -19,7 +19,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 from torchmetrics.classification import (
     MulticlassAUROC,
     MulticlassAveragePrecision,
@@ -388,69 +387,6 @@ def compute_classification_metrics(
         neutral_avg_precision=neutral_avg_precision,
         positive_avg_precision=positive_avg_precision,
         total=total,
-    )
-
-
-def compute_metrics_from_model(
-    model: torch.nn.Module,
-    dataloader: DataLoader,
-    device: str = "cpu",
-) -> ClassificationMetrics:
-    """Compute classification metrics from a model and dataloader.
-
-    Runs inference on the entire dataset and computes comprehensive metrics
-    including per-class precision/recall/F1, balanced accuracy, macro/weighted F1,
-    Cohen's kappa, MCC, and per-class AUC-ROC.
-
-    Args:
-        model: The model to evaluate (should output logits of shape (B, num_classes)).
-        dataloader: DataLoader yielding (inputs, targets) batches.
-        device: Device to run inference on.
-
-    Returns:
-        ClassificationMetrics with all computed metrics.
-    """
-    model.to(device)
-    model.eval()
-
-    all_preds: list[torch.Tensor] = []
-    all_targets: list[torch.Tensor] = []
-    all_probs: list[torch.Tensor] = []
-
-    with torch.no_grad():
-        for inputs, targets in dataloader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-
-            logits = model(inputs)
-            probs = torch.softmax(logits, dim=-1)
-
-            # Replace NaN probabilities with uniform distribution
-            nan_mask = torch.isnan(probs)
-            if nan_mask.any():
-                uniform_val = 1.0 / probs.shape[-1]
-                probs = torch.where(
-                    nan_mask,
-                    torch.tensor(uniform_val, device=probs.device),
-                    probs,
-                )
-                # Re-normalize rows
-                probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-            preds = probs.argmax(dim=-1)
-
-            all_preds.append(preds.cpu())
-            all_targets.append(targets.cpu())
-            all_probs.append(probs.cpu())
-
-    predictions = torch.cat(all_preds).numpy()
-    targets = torch.cat(all_targets).numpy()
-    probabilities = torch.cat(all_probs).numpy()
-
-    return compute_classification_metrics(
-        predictions=predictions,
-        targets=targets,
-        probabilities=probabilities,
     )
 
 

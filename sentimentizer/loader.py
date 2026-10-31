@@ -248,7 +248,7 @@ def load_train_val_corpus_datasets(
     random_state: int = 42,
 ) -> tuple[CorpusDataset, CorpusDataset]:
     df = pd.read_parquet(data_path)
-    train_df, val_df = train_test_split(df, test_size=test_size)
+    train_df, val_df = train_test_split(df, test_size=test_size, random_state=random_state)
     del df
 
     if balance_classes:

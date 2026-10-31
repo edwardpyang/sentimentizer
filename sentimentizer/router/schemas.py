@@ -1,11 +1,13 @@
 """Shared task, artifact, and classification contracts for the router."""
 
 from numbers import Integral
-from typing import Annotated, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 NonemptyString = Annotated[str, Field(min_length=1, pattern=r"\S")]
+DEFAULT_MIN_ACCURACY = 0.95
+DEFAULT_MIN_ACCEPTED = 20
 
 
 class RouterTaskSpec(BaseModel):
@@ -51,6 +53,54 @@ class RouterClassification(BaseModel):
     score: float = Field(strict=True, ge=0, le=1, allow_inf_nan=False)
 
 
+class RouterAcceptancePolicy(BaseModel):
+    """Record an empirical operating point selected on held-out policy data."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    min_accuracy: float = Field(default=DEFAULT_MIN_ACCURACY, gt=0, le=1, allow_inf_nan=False)
+    min_accepted: int = Field(default=DEFAULT_MIN_ACCEPTED, ge=1)
+    examples: int = Field(ge=1)
+    accepted: int = Field(ge=0)
+    accuracy: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> Self:
+        """Reject policies inconsistent with their saved validation evidence."""
+        if self.accepted > self.examples:
+            raise ValueError("Accepted count exceeds policy examples")
+        if self.threshold is None:
+            if self.accepted != 0 or self.accuracy is not None:
+                raise ValueError("Abstain-all policy cannot claim accepted predictions")
+        elif (
+            self.accepted < self.min_accepted
+            or self.accuracy is None
+            or self.accuracy < self.min_accuracy
+        ):
+            raise ValueError("Acceptance policy does not meet its empirical target")
+        return self
+
+
+class RouterDecision(RouterClassification):
+    """Keep the predicted topic separate from permission to route automatically."""
+
+    decision: Literal["accept", "abstain"]
+
+
+class RouterProvenance(BaseModel):
+    """Retain reproducibility details and hashes of data used to fit or select."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dataset_fingerprints: dict[str, str] = Field(default_factory=dict)
+    used_keys: dict[str, list[str]] = Field(default_factory=dict)
+    training_config: dict[str, Any] = Field(default_factory=dict)
+    library_versions: dict[str, str] = Field(default_factory=dict)
+    base_model_revision: str | None = None
+    calibration_method: str | None = None
+
+
 class RouterArtifactMetadata(BaseModel):
     """Read current and legacy router sidecars without loading model weights."""
 
@@ -58,6 +108,8 @@ class RouterArtifactMetadata(BaseModel):
     labels: list[NonemptyString] = Field(default_factory=list)
     head_type: str | None = None
     task: RouterTaskSpec | None = None
+    provenance: RouterProvenance | None = None
+    acceptance_policy: RouterAcceptancePolicy | None = None
 
     @model_validator(mode="after")
     def validate_labels(self) -> Self:

@@ -8,6 +8,7 @@ Provides:
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -19,6 +20,23 @@ from sentimentizer.config import VALID_DEVICES, OptimizationParams, SchedulerPar
 
 if TYPE_CHECKING:
     from sentimentizer.tokenizer import Tokenizer
+
+
+def unpack_saved_weights(checkpoint: dict, default_config: Any) -> tuple[dict, Any]:
+    """Split a saved weights file into its state dict and architecture config.
+
+    Weights files are a bare state dict (older files and Hub downloads) or a metadata
+    dict with ``model_state_dict``, plus ``model_config`` when the architecture was
+    tuned. ``n_heads`` cannot be recovered from weight shapes, so the saved config must
+    win over defaults.
+    """
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    saved_config = checkpoint.get("model_config")
+    if not saved_config:
+        return state_dict, default_config
+    known = {f.name for f in dataclasses.fields(default_config)}
+    overrides = {key: value for key, value in saved_config.items() if key in known}
+    return state_dict, dataclasses.replace(default_config, **overrides)
 
 
 class BaseSentimentModel(nn.Module):
@@ -76,8 +94,11 @@ class BaseSentimentModel(nn.Module):
         cls, ckpt_dir: Path, metadata: dict, device: str
     ) -> BaseSentimentModel:
         """Construct an instance and restore weights."""
-        state_dict = metadata.get("model_state_dict", metadata)
+        _ensure_registry()
         model_type = cls.MODEL_TYPE
+        state_dict, config = unpack_saved_weights(
+            metadata, _MODEL_REGISTRY[model_type]["config_class"]()
+        )
 
         emb_shape = state_dict["embed_layer.weight"].shape
         empty_embeddings = torch.zeros(emb_shape)
@@ -85,9 +106,6 @@ class BaseSentimentModel(nn.Module):
         num_classes = state_dict.get("_metadata", {}).get("num_classes", 3)
         if "classifier.3.weight" in state_dict:
             num_classes = state_dict["classifier.3.weight"].shape[0]
-
-        entry = _MODEL_REGISTRY[model_type]
-        config = entry["config_class"]()
 
         if model_type == "rnn":
             hidden_size = state_dict["classifier.0.weight"].shape[1] // 2

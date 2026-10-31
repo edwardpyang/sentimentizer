@@ -201,6 +201,7 @@ def make_predictor(path, model=None):
     from sentimentizer.predictor import SentimentPredictor
 
     predictor = SentimentPredictor.__new__(SentimentPredictor)
+    predictor._initialize_router_state()
     predictor._router_model_path = str(path)
     predictor.router = model
     predictor._router_loaded = model is not None

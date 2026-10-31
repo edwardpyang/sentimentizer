@@ -26,6 +26,8 @@ Usage::
 from __future__ import annotations
 
 import importlib.metadata
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -95,12 +97,18 @@ class SentimentPredictor:
         if router_model_path is None:
             router_model_path = DEFAULT_ROUTER_MODEL_PATH
         self._router_model_path: str = router_model_path
-        self.router: Any = None
-        self._router_error: str | None = None
-        self._router_loaded: bool = False
+        self._initialize_router_state()
 
         # --- Version ---
         self._version = self._detect_version()
+
+    def _initialize_router_state(self) -> None:
+        """Create per-predictor coordination before the instance becomes shared."""
+        self.router: Any = None
+        self._router_error: str | None = None
+        self._router_loaded: bool = False
+        self._router_loading = False
+        self._router_condition = threading.Condition()
 
     # ------------------------------------------------------------------
     # Initialization helpers
@@ -190,10 +198,61 @@ class SentimentPredictor:
         in which case the cached error is reused so we don't retry on
         every request).
         """
-        if self._router_loaded or self._router_error is not None:
-            return
-        self.router, self._router_error = self._load_router_model(self._router_model_path)
-        self._router_loaded = self.router is not None
+        with self._router_condition:
+            self._router_condition.wait_for(lambda: not self._router_loading)
+            if self._router_loaded or self._router_error is not None:
+                return
+            self._router_loading = True
+        router, error = None, "Router loading was interrupted"
+        started = time.monotonic()
+        try:
+            # Construction/network I/O occurs without holding the condition.
+            router, error = self._load_router_model(self._router_model_path)
+        except Exception as exc:
+            error = f"Router load failed ({type(exc).__name__})"
+            logger.exception("Router construction failed")
+        finally:
+            with self._router_condition:
+                self.router = router
+                self._router_error = (
+                    (error or "Router model did not load") if router is None else None
+                )
+                self._router_loaded = router is not None
+                self._router_loading = False
+                self._router_condition.notify_all()
+            logger.info(
+                "Router load attempt completed",
+                loaded=router is not None,
+                duration_s=time.monotonic() - started,
+            )
+
+    def load_router(self) -> bool:
+        """Warm up the router, preserving a previously memoized failure."""
+        self._ensure_router_loaded()
+        return self.router_loaded
+
+    def retry_router_load(self) -> bool:
+        """Explicitly retry terminal failure, or join an already active attempt."""
+        with self._router_condition:
+            if self._router_loading:
+                self._router_condition.wait_for(lambda: not self._router_loading)
+                return self.router_loaded
+            if self.router_loaded:
+                return True
+            self._router_error = None
+        return self.load_router()
+
+    @property
+    def router_loading(self) -> bool:
+        """Report construction progress without starting or waiting for a load."""
+        with self._router_condition:
+            return self._router_loading
+
+    @property
+    def router_decisions_ready(self) -> bool:
+        """Report whether the published router has an acceptance policy."""
+        with self._router_condition:
+            return self._router_loaded and self.router.acceptance_policy is not None
 
     # ------------------------------------------------------------------
     # Properties
@@ -207,12 +266,14 @@ class SentimentPredictor:
     @property
     def router_loaded(self) -> bool:
         """Whether the router model loaded successfully."""
-        return self.router is not None
+        with self._router_condition:
+            return self._router_loaded
 
     @property
     def router_error(self) -> str | None:
         """Error message if router failed to load, else None."""
-        return self._router_error
+        with self._router_condition:
+            return self._router_error
 
     @property
     def model_error(self) -> str | None:
@@ -334,6 +395,26 @@ class SentimentPredictor:
             )
         return results
 
+    def decide(self, text: str) -> dict[str, Any]:
+        """Return a predicted topic and a separate accept/abstain decision."""
+        return self.decide_batch([text])[0]
+
+    def decide_batch(self, texts: list[str]) -> list[dict[str, Any]]:
+        """Apply the artifact's calibrated policy while preserving input order."""
+        self._ensure_router_loaded()
+        if not self.router_loaded:
+            raise RuntimeError(f"Router model not loaded: {self._router_error}")
+        predictions = self.router.decide_batch(texts)
+        return [
+            {
+                "prediction": {
+                    **prediction.model_dump(mode="json"),
+                    "token_count": len(regex_tokenize(text)),
+                }
+            }
+            for text, prediction in zip(texts, predictions, strict=True)
+        ]
+
     # ------------------------------------------------------------------
     # Tokenization
     # ------------------------------------------------------------------
@@ -409,17 +490,20 @@ class SentimentPredictor:
 
     def get_router_model_info(self) -> dict[str, Any]:
         """Return metadata about the loaded router model."""
+        with self._router_condition:
+            router = self.router if self._router_loaded else None
+            error = self._router_error
         info: dict[str, Any] = {
             "model_path": self._router_model_path,
             "categories": [],
             "task_id": None,
             "taxonomy_version": None,
-            "status": "loaded" if self.router_loaded else "not_loaded",
+            "status": "loaded" if router is not None else "not_loaded",
         }
         task = None
-        if self.router_loaded:
-            task = self.router.task
-            info["categories"] = self.router.labels or self.router.class_labels()
+        if router is not None:
+            task = router.task
+            info["categories"] = router.labels or router.class_labels()
         else:
             try:
                 metadata = RouterModel.read_metadata(self._router_model_path)
@@ -439,8 +523,8 @@ class SentimentPredictor:
                 task_id=task.task_id,
                 taxonomy_version=task.taxonomy_version,
             )
-        if self._router_error:
-            info["error"] = self._router_error
+        if error:
+            info["error"] = error
         return info
 
 

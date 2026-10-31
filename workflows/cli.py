@@ -339,7 +339,10 @@ def router() -> None:
 
 
 @router.command("train")
-@click.option("--data", type=click.Path(exists=True), help="Path to augmented JSONL data")
+@click.option("--data", required=True, type=click.Path(exists=True), help="Training JSONL data")
+@click.option(
+    "--validation-data", type=click.Path(exists=True), help="Independent validation JSONL"
+)
 @click.option(
     "--base-model",
     default=None,
@@ -357,6 +360,7 @@ def router() -> None:
 def router_train(
     ctx: click.Context,
     data: str,
+    validation_data: str | None,
     base_model: str | None,
     output_dir: str | None,
     config_path: str | None,
@@ -366,7 +370,12 @@ def router_train(
     from pathlib import Path
 
     from sentimentizer.router.config import load_router_config
-    from sentimentizer.router.dataset import load_router_dataset
+    from sentimentizer.router.dataset import (
+        assert_disjoint,
+        load_router_dataset,
+        load_router_records,
+        records_to_dataset,
+    )
     from sentimentizer.router.train_router import train_router
 
     train_cfg, _ = load_router_config(config_path)
@@ -375,11 +384,77 @@ def router_train(
         base_model=base_model or train_cfg.base_model,
         output_dir=Path(output_dir) if output_dir else train_cfg.output_dir,
     )
-    train_ds, eval_ds = load_router_dataset(data, seed=config.seed)
+    if validation_data:
+        train_rows, eval_rows = load_router_records(data), load_router_records(validation_data)
+        assert_disjoint(train_rows, eval_rows)
+        train_ds, eval_ds = records_to_dataset(train_rows), records_to_dataset(eval_rows)
+    else:
+        train_ds, eval_ds = load_router_dataset(data, seed=config.seed)
     train_router(config, train_ds, eval_ds)
 
 
+@router.command("split")
+@click.option("--data", required=True, type=click.Path(exists=True))
+@click.option("--output-dir", required=True, type=click.Path())
+@click.option(
+    "--test-size", default=0.2, type=click.FloatRange(min=0, max=1, min_open=True, max_open=True)
+)
+@click.option(
+    "--validation-size",
+    default=0.2,
+    type=click.FloatRange(min=0, max=1, min_open=True, max_open=True),
+)
+@click.option("--seed", default=42, type=int)
+@click.option("--calibration-size", default=0.0, type=click.FloatRange(min=0, max=1, max_open=True))
+@click.option("--policy-size", default=0.0, type=click.FloatRange(min=0, max=1, max_open=True))
+def router_split(
+    data: str,
+    output_dir: str,
+    test_size: float,
+    validation_size: float,
+    seed: int,
+    calibration_size: float,
+    policy_size: float,
+) -> None:
+    """Split original sources BEFORE augmenting the training partition."""
+    from pathlib import Path
+
+    from sentimentizer.router.dataset import (
+        assert_disjoint,
+        load_router_records,
+        save_dataset_to_jsonl,
+        split_router_records,
+    )
+
+    sizes = {
+        "test": test_size,
+        "validation": validation_size,
+        "calibration": calibration_size,
+        "policy": policy_size,
+    }
+    if sum(sizes.values()) >= 1:
+        raise click.UsageError("Held-out split fractions must sum to less than one")
+    train = load_router_records(data)
+    remaining = 1.0
+    partitions = {}
+    for name, size in sizes.items():
+        if size:
+            train, partitions[name] = split_router_records(train, size / remaining, seed)
+            remaining -= size
+    partitions["train"] = train
+    assert_disjoint(*partitions.values())
+    for name, rows in partitions.items():
+        save_dataset_to_jsonl(rows, str(Path(output_dir) / f"{name}.jsonl"))
+        click.echo(f"{name}: {len(rows)} records")
+
+
 @router.command("augment")
+@click.option(
+    "--seeds",
+    "seed_path_override",
+    type=click.Path(exists=True),
+    help="Training partition JSONL; overrides seed_path",
+)
 @click.option(
     "--output",
     default=None,
@@ -404,7 +479,7 @@ def router_train(
 @click.option(
     "--resume",
     is_flag=True,
-    help="Resume from existing output file, skipping already-processed seeds",
+    help="Resume missing variations using persisted seed lineage and counts",
 )
 @click.option(
     "--config",
@@ -416,6 +491,7 @@ def router_train(
 @click.pass_context
 def router_augment(
     ctx: click.Context,
+    seed_path_override: str | None,
     output: str | None,
     model: str | None,
     variations: int | None,
@@ -429,21 +505,19 @@ def router_augment(
     so you can see progress in real-time. Defaults come from
     router/config.yaml; CLI flags override when provided.
 
-    Use --resume to continue an interrupted augmentation: seeds that
-    already appear in the output file are skipped, and new entries are
-    appended to the existing file.
+    Use --resume to retry missing variations for incomplete seeds.
     """
     from pathlib import Path
 
-    from sentimentizer.router.augment import augment_seeds
+    from sentimentizer.router.augment import augment_seeds, augmentation_counts, prepare_seeds
     from sentimentizer.router.config import FOOD_TASK_SPEC, load_router_config
     from sentimentizer.router.dataset import load_router_records
     from sentimentizer.router.seeds import SEED_UTTERANCES
 
     train_cfg, augment_cfg = load_router_config(config_path)
-    if augment_cfg.seed_path:
-        seed_path = Path(augment_cfg.seed_path)
-        if config_path and not seed_path.is_absolute():
+    if seed_path_override or augment_cfg.seed_path:
+        seed_path = Path(seed_path_override or augment_cfg.seed_path)
+        if not seed_path_override and config_path and not seed_path.is_absolute():
             seed_path = Path(config_path).parent / seed_path
         seeds = load_router_records(seed_path)
     elif train_cfg.task == FOOD_TASK_SPEC:
@@ -452,7 +526,7 @@ def router_augment(
         raise click.UsageError("Custom tasks require augmentation.seed_path")
     effective_model = model or augment_cfg.model
     effective_url = ollama_url or augment_cfg.ollama_url
-    effective_variations = variations or augment_cfg.variations_per_seed
+    effective_variations = variations if variations is not None else augment_cfg.variations_per_seed
     effective_output = output or augment_cfg.output_path
 
     if resume:
@@ -469,6 +543,15 @@ def router_augment(
         resume=resume,
         task=train_cfg.task,
     )
+    counts = augmentation_counts(augmented)
+    incomplete = sum(
+        counts.get(seed["seed_id"], 0) < effective_variations
+        for seed in prepare_seeds(seeds, train_cfg.task)
+    )
+    if incomplete:
+        raise click.ClickException(
+            f"{incomplete} seeds incomplete; partial output saved. Retry with --resume"
+        )
     click.echo(f"Done: {len(augmented)} total utterances written to {effective_output}")
 
 
@@ -492,6 +575,8 @@ def router_evaluate(ctx: click.Context, model_path: str, data: str | None) -> No
             "text": [row["text"] for row in records],
             "label": [row["label"] for row in records],
         }
+        if any("group_id" in row for row in records):
+            eval_ds["group_id"] = [row.get("group_id") for row in records]
         report = evaluate_router(model, eval_ds)
         click.echo(
             json.dumps(
@@ -500,6 +585,80 @@ def router_evaluate(ctx: click.Context, model_path: str, data: str | None) -> No
         )
     else:
         click.echo("No evaluation data provided. Use --data to specify a JSONL file.")
+
+
+@router.command("calibrate")
+@click.option("--model-path", required=True, type=click.Path(exists=True))
+@click.option("--calibration-data", required=True, type=click.Path(exists=True))
+@click.option("--policy-data", required=True, type=click.Path(exists=True))
+@click.option("--output-dir", required=True, type=click.Path())
+@click.option("--min-accuracy", default=None, type=click.FloatRange(min=0, max=1, min_open=True))
+@click.option("--min-accepted", default=None, type=click.IntRange(min=1))
+def router_calibrate(
+    model_path: str,
+    calibration_data: str,
+    policy_data: str,
+    output_dir: str,
+    min_accuracy: float | None,
+    min_accepted: int | None,
+) -> None:
+    """Fit probability calibration and select acceptance on separate held-out files."""
+    from pathlib import Path
+
+    from sentimentizer.router.calibration import (
+        DEFAULT_MIN_ACCEPTED,
+        DEFAULT_MIN_ACCURACY,
+        calibrate_router,
+    )
+    from sentimentizer.router.dataset import load_router_records
+    from sentimentizer.router.model import RouterModel
+
+    if Path(model_path).resolve() == Path(output_dir).resolve():
+        raise click.UsageError("Use a different output-dir to preserve the uncalibrated artifact")
+    model = calibrate_router(
+        RouterModel.from_pretrained(model_path),
+        load_router_records(calibration_data),
+        load_router_records(policy_data),
+        min_accuracy=min_accuracy if min_accuracy is not None else DEFAULT_MIN_ACCURACY,
+        min_accepted=min_accepted if min_accepted is not None else DEFAULT_MIN_ACCEPTED,
+    )
+    model.save_pretrained(output_dir)
+    if model.acceptance_policy is not None:
+        click.echo(model.acceptance_policy.model_dump_json(indent=2))
+
+
+@router.command("benchmark")
+@click.option("--train-data", required=True, type=click.Path(exists=True))
+@click.option("--validation-data", required=True, type=click.Path(exists=True))
+@click.option("--test-data", required=True, type=click.Path(exists=True))
+@click.option("--output-dir", required=True, type=click.Path())
+@click.option("--config", "config_path", type=click.Path(exists=True))
+@click.option("--repeats", default=None, type=click.IntRange(min=1))
+def router_benchmark(
+    train_data: str,
+    validation_data: str,
+    test_data: str,
+    output_dir: str,
+    config_path: str | None,
+    repeats: int | None,
+) -> None:
+    """Compare TF-IDF, frozen encoder and contrastive encoder on the same split."""
+    from dataclasses import replace
+    from pathlib import Path
+
+    from sentimentizer.router.benchmark import BENCHMARK_REPEATS, benchmark_router
+    from sentimentizer.router.config import load_router_config
+    from sentimentizer.router.dataset import load_router_records
+
+    config, _ = load_router_config(config_path)
+    benchmark_router(
+        replace(config, output_dir=Path(output_dir)),
+        load_router_records(train_data),
+        load_router_records(validation_data),
+        load_router_records(test_data),
+        repeats=repeats if repeats is not None else BENCHMARK_REPEATS,
+    )
+    click.echo(f"Benchmark report: {Path(output_dir) / 'benchmark_report.json'}")
 
 
 @router.command("push")
@@ -621,8 +780,14 @@ def run(
     """
     from workflows.stages.extract import run_extract
     from workflows.stages.tokenize import run_tokenize
-    from workflows.stages.train import run_train
+    from workflows.stages.train import run_train, validate_train_options
 
+    validate_train_options(
+        ctx.obj,
+        distributed=train_kwargs["distributed"],
+        resume=resume_train,
+        checkpoint_dir=train_kwargs["checkpoint_dir"],
+    )
     run_extract(ctx.obj, stop=stop)
     run_tokenize(ctx.obj, resume=resume_tokenize)
     run_train(ctx.obj, resume=resume_train, **train_kwargs)

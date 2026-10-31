@@ -43,10 +43,11 @@ def test_augmentation_rejects_wrong_labels_and_preserves_parent_metadata(monkeyp
     monkeypatch.setattr("sentimentizer.router.augment.requests.post", lambda *a, **k: response)
     monkeypatch.setattr("sentimentizer.router.augment.time.sleep", lambda _: None)
     seed = {"text": "seed", "label": 0, "group_id": "parent"}
-    assert augment_seeds([seed], task=task) == [
-        seed,
-        {"text": "valid", "label": 0, "group_id": "parent"},
-    ]
+    records = augment_seeds([seed], task=task)
+    assert [row["text"] for row in records] == ["seed", "valid"]
+    assert all(row["label"] == 0 and row["group_id"] == "parent" for row in records)
+    assert records[0]["seed_id"] == records[1]["seed_id"]
+    assert records[1]["is_seed"] is False
 
 
 def test_jsonl_preserves_grouping_and_extra_metadata(tmp_path):
@@ -106,8 +107,8 @@ def test_training_uses_task_and_all_loaded_settings(monkeypatch, tmp_path):
     assert model.task == task
     assert model.labels == ["a", "b"]
     assert backbone.max_seq_length == 64
-    assert backbone.fit.call_args.kwargs["epochs"] == 3
-    assert backbone.fit.call_args.kwargs["train_objectives"][0][0].batch_size == 4
+    assert backbone.old_fit.call_args.kwargs["epochs"] == 3
+    assert backbone.old_fit.call_args.kwargs["train_objectives"][0][0].batch_size == 4
     save.assert_called_once()
 
 
@@ -175,7 +176,11 @@ def test_custom_task_augmentation_requires_seeds_and_resolves_relative_paths(mon
 
     config_path = tmp_path / "config.yaml"
     write_config(config_path)
-    augment = MagicMock(return_value=[])
+    from sentimentizer.router.augment import prepare_seeds
+
+    seed = {"text": "example", "label": 0}
+    prepared = prepare_seeds([seed], RouterTaskSpec(task_id="test", labels=("a", "b")))[0]
+    augment = MagicMock(return_value=[prepared] + [{**prepared, "is_seed": False}] * 50)
     monkeypatch.setattr("sentimentizer.router.augment.augment_seeds", augment)
     args = ["router", "augment", "--config", str(config_path)]
     result = CliRunner().invoke(cli, args)
