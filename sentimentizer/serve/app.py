@@ -31,12 +31,16 @@ Endpoints:
   Router (review categorization):
     POST /v1/router/predict   -- Route a single text (auto-batched)
     POST /v1/router/batch     -- Route multiple texts
+    POST /v1/router/decide    -- Topic plus accept/abstain decision (auto-batched)
+    POST /v1/router/decide/batch -- Decisions for multiple texts
+    POST /v1/router/load      -- Warm up or explicitly retry the router load
     GET  /v1/router/models    -- Router model metadata
 
   Infrastructure (unversioned):
     GET  /health               -- Backward-compatible alias for /health/ready
     GET  /health/live          -- Liveness probe (always 200)
     GET  /health/ready         -- Readiness probe (503 if model not loaded)
+    GET  /health/router        -- Router readiness, without triggering a load
     GET  /metrics              -- Prometheus service and request metrics
 
   Deprecated (kept for backward compatibility, use /v1/sentiment/* instead):
@@ -49,6 +53,7 @@ Endpoints:
 
 import asyncio
 import os
+import re
 import struct
 import threading
 import time
@@ -114,6 +119,26 @@ from sentimentizer.serve.models import (
 # ---------------------------------------------------------------------------
 
 _VERSION = _pkg_version("sentimentizer")
+
+# Caller-supplied IDs are echoed in headers and logs, so only accept plain tokens.
+_REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
+def _internal_error_response(
+    request_id: str, *, headers: dict[str, str] | None = None
+) -> JSONResponse:
+    """Build the 500 envelope without exposing exception details."""
+    return JSONResponse(
+        status_code=500,
+        headers=headers,
+        content={
+            "error": {
+                "code": "internal_error",
+                "message": "Internal server error",
+                "request_id": request_id,
+            }
+        },
+    )
 
 
 class _RequestBodySizeLimitMiddleware(BaseHTTPMiddleware):
@@ -249,6 +274,29 @@ def create_fastapi_app(
         path_limits=path_limits,
     )
 
+    @app.middleware("http")
+    async def request_id_middleware(
+        request: StarletteRequest,
+        call_next: Callable[[StarletteRequest], Awaitable[StarletteResponse]],
+    ) -> StarletteResponse:
+        """Add X-Request-Id to every request/response for distributed tracing."""
+        supplied_id = request.headers.get("X-Request-Id", "")
+        request_id = (
+            supplied_id if _REQUEST_ID_PATTERN.fullmatch(supplied_id) else str(uuid.uuid4())
+        )
+        request.state.request_id = request_id
+        try:
+            response = await call_next(request)
+        except Exception:
+            # Handle it here, inside CORS: Starlette runs the app-level Exception
+            # handler outside all middleware, so that response has no CORS headers
+            # and browser clients could not read the error.
+            logger.exception("unhandled error in request", request_id=request_id)
+            response = _internal_error_response(request_id)
+        response.headers["X-Request-Id"] = request_id
+        return response
+
+    # Added last, so it is outermost and also covers responses from the middleware above.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cfg.cors_origins,
@@ -258,33 +306,12 @@ def create_fastapi_app(
         expose_headers=["X-Request-Id"],
     )
 
-    @app.middleware("http")
-    async def request_id_middleware(
-        request: StarletteRequest,
-        call_next: Callable[[StarletteRequest], Awaitable[StarletteResponse]],
-    ) -> StarletteResponse:
-        """Add X-Request-Id to every request/response for distributed tracing."""
-        request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
-        request.state.request_id = request_id
-        response = await call_next(request)
-        response.headers["X-Request-Id"] = request_id
-        return response
-
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-        """Centralized handler for all unhandled exceptions."""
+        """Report failures raised outside the request-ID middleware."""
         request_id = getattr(request.state, "request_id", "unknown")
         logger.exception("unhandled error in request", request_id=request_id)
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": {
-                    "code": "internal_error",
-                    "message": "Internal server error",
-                    "request_id": request_id,
-                }
-            },
-        )
+        return _internal_error_response(request_id, headers={"X-Request-Id": request_id})
 
     app.add_exception_handler(HTTPException, http_exception_handler)
 
@@ -295,10 +322,8 @@ def _status_code_to_error_code(status_code: int) -> str:
     """Map common HTTP status codes to machine-readable error codes."""
     mapping = {
         400: "bad_request",
-        401: "invalid_api_key",
         403: "forbidden",
         404: "not_found",
-        409: "idempotency_key_conflict",
         413: "request_too_large",
         422: "validation_error",
         429: "rate_limit_exceeded",
@@ -573,6 +598,11 @@ class SentimentizerDeployment:
     async def tokenize(self, body: TokenizeRequest) -> dict[str, Any]:
         """POST /v1/sentiment/tokenize -- standalone tokenization without inference."""
         self._require_ready()
+        if not self.predictor.can_tokenize:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Tokenizer not available: {self.predictor.model_error}",
+            )
         result = await asyncio.to_thread(self.predictor.tokenize, body.text)
         return result
 
@@ -588,7 +618,7 @@ class SentimentizerDeployment:
     @app.get("/v1/models/{model_name}", response_model=ModelDetailResponse, deprecated=True)
     async def model_detail(
         self,
-        model_name: str = Path(..., description="Model name: rnn, encoder, or decoder"),
+        model_name: str = Path(..., description="Model name: rnn, encoder, decoder, or modernbert"),
     ) -> dict[str, Any]:
         """GET /v1/sentiment/models/{model_name} -- single model metadata."""
         self._require_ready()
@@ -872,7 +902,7 @@ class SentimentizerDeployment:
             "device": self.predictor.device,
             "version": self.predictor.version,
             "uptime_s": round(time.time() - self._started_at, 1),
-            "model_loaded": self.predictor.model_name,
+            "model_loaded": self.predictor.model_name if self.predictor.model_loaded else None,
             "router_loaded": self.predictor.router_loaded,
             "router_error": self.predictor.router_error,
         }
@@ -906,7 +936,7 @@ def main(host: str | None = None, port: int | None = None) -> None:
     host = cfg.serve_host if host is None else host
     port = cfg.serve_port if port is None else port
 
-    # RAY_ENABLE_UV_RUN_RUNTIME_ENV is already set at module level (line 51).
+    # RAY_ENABLE_UV_RUN_RUNTIME_ENV is already set at module level.
     os.environ.setdefault("RAY_ENABLE_RUNTIME_ENV_HOOK", "1")
     os.environ.setdefault("RAY_OVERRIDE_RUNTIME_ENV_DEFAULT_EXCLUDES", "")
 

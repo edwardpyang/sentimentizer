@@ -426,3 +426,30 @@ class TestGraphConstruction:
         assert state["history"] == []
         assert state["best_accuracy"] == 0.0
         assert state["converged"] is False
+
+
+class TestSearchBudget:
+    """The web search budget is documented as per agent run."""
+
+    def test_each_agent_run_gets_a_fresh_budget(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        from sentimentizer.agent import graph as graph_module
+        from sentimentizer.agent import websearch
+
+        for _ in range(websearch.MAX_CALLS_PER_RUN):
+            websearch._check_rate_limit()
+        with pytest.raises(RuntimeError, match="rate limit"):
+            websearch._check_rate_limit()
+
+        compiled = AsyncMock()
+        compiled.ainvoke.return_value = {"best_config": {}, "best_accuracy": 0.5}
+        with (
+            patch.object(graph_module, "build_graph", return_value=compiled),
+            patch.object(graph_module, "create_initial_state", return_value={}),
+        ):
+            asyncio.run(graph_module.run_agent_tuning("rnn"))
+
+        websearch._check_rate_limit()
+        websearch.reset_rate_limit()

@@ -598,7 +598,12 @@ def _update_training_metrics() -> None:
                     g.labels(**lbl).set(0)
                 continue
 
-            data = json.loads(path.read_text())
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError) as exc:
+                # Skip only this model; gauges were already cleared for this pass.
+                logger.warning("Skipping unreadable metrics file %s: %s", path, exc)
+                continue
             if not isinstance(data, dict):
                 continue
 

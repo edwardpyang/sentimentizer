@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sentimentizer"
-version = "0.331.0"
+version = "0.332.0"
 description = "smole language models"
 readme = "README.md"
 authors = [{ name = "Edward Yang", email = "edwardpyang@gmail.com" }]
@@ -143,6 +143,16 @@ reportReturnType = "warning"
 reportInvalidTypeVarUse = "warning"
 reportMissingImports = "warning"
 
+
+[tool.coverage.run]
+source = ["sentimentizer", "workflows"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

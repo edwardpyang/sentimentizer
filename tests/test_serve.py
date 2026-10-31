@@ -134,23 +134,9 @@ def _mock_deployment(predictor=None, ready=True, load_error=None):
         texts = [inp["text"] for inp in inputs]
         return dep.predictor.classify_batch(texts)
 
-    async def _health_ready():
-        body = {
-            "status": "ready" if dep.predictor.model_loaded else "not_ready",
-            "device": dep.predictor.device,
-            "version": dep.predictor.version,
-            "uptime_s": round(time.time() - dep._started_at, 1),
-            "model_loaded": dep.predictor.model_name,
-            "router_loaded": dep.predictor.router_loaded,
-            "router_error": dep.predictor.router_error,
-        }
-        if not dep.predictor.model_loaded:
-            return JSONResponse(status_code=503, content=body)
-        return body
-
     dep.predict_sentiment = _predict_sentiment
     dep.classify_route = _classify_route
-    dep.health_ready = _health_ready
+    dep.health_ready = lambda: _SentimentizerDeployment.health_ready(dep)
     return dep
 
 

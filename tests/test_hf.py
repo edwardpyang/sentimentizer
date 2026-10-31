@@ -4,10 +4,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from huggingface_hub.utils import EntryNotFoundError
 
 from sentimentizer.config import HF_WEIGHTS_REPOS
 from sentimentizer.hf import (
     _HF_MODEL_TYPES,
+    _copy_atomic,
     download_weights,
     pull_model_from_hub,
     push_model_to_hub,
@@ -752,7 +754,7 @@ class TestRouterAutoDownload:
         mock_get_model: MagicMock,
     ) -> None:
         """Only the default food router downloads lazily when its path is missing."""
-        from sentimentizer.config import HF_ROUTER_REPO
+        from sentimentizer.config import HF_ROUTER_REPO, HF_ROUTER_REVISION
         from sentimentizer.predictor import SentimentPredictor
         from sentimentizer.router.config import DEFAULT_ROUTER_MODEL_PATH
 
@@ -765,10 +767,12 @@ class TestRouterAutoDownload:
             mock_snap.assert_not_called()
             with pytest.raises(RuntimeError):
                 predictor.classify("hello")
-            mock_snap.assert_called_once_with(
-                repo_id=HF_ROUTER_REPO,
-                local_dir=DEFAULT_ROUTER_MODEL_PATH,
-            )
+            mock_snap.assert_called_once()
+            kwargs = mock_snap.call_args.kwargs
+            assert kwargs["repo_id"] == HF_ROUTER_REPO
+            assert kwargs["revision"] == HF_ROUTER_REVISION
+            # Downloads go to a staging directory, published to the real path when complete.
+            assert kwargs["local_dir"] != DEFAULT_ROUTER_MODEL_PATH
 
     @patch("sentimentizer.predictor.get_trained_model")
     @patch("sentimentizer.predictor.get_trained_tokenizer")
@@ -832,3 +836,101 @@ class TestRouterAutoDownload:
             predictor = SentimentPredictor(model_name="encoder")
             mock_snap.assert_not_called()
             assert predictor.router is None
+
+
+class TestDownloadCompleteness:
+    """The weights file marks a complete download, so it must be written last."""
+
+    @staticmethod
+    def _download(source: Path, missing: set[str] | None = None, broken: set[str] | None = None):
+        def fake(*, repo_id: str, filename: str) -> str:
+            if filename in (missing or set()):
+                raise EntryNotFoundError(f"{filename} missing")
+            if filename in (broken or set()):
+                raise ConnectionError("network lost")
+            return str(source)
+
+        return fake
+
+    @pytest.mark.parametrize(
+        ("kwargs", "reason"),
+        [
+            ({"missing": {"backbone/model.safetensors"}}, "required file absent"),
+            ({"broken": {"backbone/tokenizer.json"}}, "network failure"),
+        ],
+    )
+    def test_incomplete_backbone_fails_without_weights_file(
+        self, tmp_path: Path, kwargs: dict, reason: str
+    ) -> None:
+        source = tmp_path / "source"
+        source.write_bytes(b"data")
+        dest = tmp_path / "out" / "modernbert_weights.pth"
+
+        with patch("sentimentizer.hf.hf_hub_download", self._download(source, **kwargs)):
+            assert download_weights("modernbert", dest) is None, reason
+
+        assert not dest.exists()
+
+    def test_absent_optional_backbone_file_is_skipped(self, tmp_path: Path) -> None:
+        source = tmp_path / "source"
+        source.write_bytes(b"data")
+        dest = tmp_path / "out" / "modernbert_weights.pth"
+        fake = self._download(source, missing={"backbone/tokenizer.model"})
+
+        with patch("sentimentizer.hf.hf_hub_download", fake):
+            assert download_weights("modernbert", dest) == dest
+
+        assert dest.read_bytes() == b"data"
+        assert (dest.parent / "backbone" / "config.json").exists()
+        assert not (dest.parent / "backbone" / "tokenizer.model").exists()
+        assert not list(dest.parent.glob(".*.partial"))
+
+    def test_failed_copy_keeps_previous_file(self, tmp_path: Path) -> None:
+        source = tmp_path / "source"
+        source.write_bytes(b"new")
+        dest = tmp_path / "weights.pth"
+        dest.write_bytes(b"old")
+
+        with (
+            patch("sentimentizer.hf.shutil.copy2", side_effect=OSError("disk full")),
+            pytest.raises(OSError, match="disk full"),
+        ):
+            _copy_atomic(source, dest)
+
+        assert dest.read_bytes() == b"old"
+        assert not list(tmp_path.glob(".*.partial"))
+
+
+class TestPushResult:
+    @staticmethod
+    def _weights(tmp_path: Path) -> Path:
+        weights = tmp_path / "weights.pth"
+        weights.write_bytes(b"data")
+        return weights
+
+    @patch("sentimentizer.hf.HfApi")
+    def test_success_returns_true(self, api_cls: MagicMock, tmp_path: Path) -> None:
+        assert push_model_to_hub(self._weights(tmp_path), "rnn", "me/repo") is True
+
+    def test_missing_weights_return_false(self, tmp_path: Path) -> None:
+        assert push_model_to_hub(tmp_path / "missing", "rnn", "me/repo") is False
+
+    @patch("sentimentizer.hf.HfApi")
+    def test_upload_error_returns_false(self, api_cls: MagicMock, tmp_path: Path) -> None:
+        api_cls.return_value.upload_file.side_effect = RuntimeError("500 Server Error")
+        assert push_model_to_hub(self._weights(tmp_path), "rnn", "me/repo") is False
+
+    @patch("sentimentizer.hf.HfApi")
+    def test_missing_repo_is_created_and_retried(self, api_cls: MagicMock, tmp_path: Path) -> None:
+        api = api_cls.return_value
+        api.upload_file.side_effect = [RuntimeError("Repository Not Found"), None, None]
+
+        assert push_model_to_hub(self._weights(tmp_path), "rnn", "me/repo") is True
+        api.create_repo.assert_called_once_with(repo_id="me/repo", exist_ok=True)
+
+    @patch("sentimentizer.hf.HfApi")
+    def test_hf_model_without_backbone_is_not_a_successful_push(
+        self, api_cls: MagicMock, tmp_path: Path
+    ) -> None:
+        """Weights without their backbone cannot be loaded by anyone who pulls them."""
+        assert push_model_to_hub(self._weights(tmp_path), "modernbert", "me/repo") is False

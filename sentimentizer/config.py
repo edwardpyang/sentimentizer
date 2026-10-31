@@ -293,6 +293,9 @@ HF_WEIGHTS_REPOS: dict[str, str] = {
 # The router uses snapshot_download (whole-repo) rather than individual
 # file downloads, so it lives outside HF_WEIGHTS_REPOS.
 HF_ROUTER_REPO: str = "ryeyoo/sentimentizer-router"
+# The router head is a joblib pickle, so loading it executes code from the artifact.
+# Auto-download only this reviewed commit; bump it after each `make upload-router`.
+HF_ROUTER_REVISION: str = "8cc4ca2b1f09da940ff1ca9ab1cd0d73ef0ed717"
 
 
 @dataclass

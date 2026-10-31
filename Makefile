@@ -1,5 +1,5 @@
 .PHONY: setup setup-ci setup-dev download-data train train-rnn train-encoder train-decoder train-modernbert \
-       train-distributed train-quick train-no-checkpoint train-resume serve test test-verbose test-lint lint format check typecheck ci clean docker-build docker-run \
+       train-distributed train-quick train-no-checkpoint train-resume serve test test-verbose test-lint test-cov lint format check typecheck ci clean docker-build docker-run \
  	   gpu-reset tune tune-rnn tune-encoder tune-decoder tune-standalone \
  	   start-metrics stop-metrics setup-dashboards start-exporter stop-exporter stop-ray \
  	   upload-rnn upload-encoder upload-decoder upload-modernbert upload-router \
@@ -277,9 +277,9 @@ test-verbose:
 test-lint: lint
 	uv run pytest tests/
 
-## Run tests with coverage report
+## Run tests with line and branch coverage (scope is set in pyproject.toml)
 test-cov:
-	uv run pytest tests/ --cov=sentimentizer --cov-report=term-missing
+	uv run pytest tests/ --cov --cov-report=term-missing
 
 ## Run only Ray Train tests
 test-ray:

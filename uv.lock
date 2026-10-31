@@ -3623,7 +3623,7 @@ wheels = [
 
 [[package]]
 name = "sentimentizer"
-version = "0.331.0"
+version = "0.332.0"
 source = { editable = "." }
 dependencies = [
     { name = "bitsandbytes" },

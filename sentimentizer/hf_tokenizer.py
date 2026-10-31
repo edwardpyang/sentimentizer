@@ -15,7 +15,7 @@ except ImportError:
     TRANSFORMERS_AVAILABLE = False
 
 from sentimentizer import new_logger
-from sentimentizer.config import DEFAULT_LOG_LEVEL
+from sentimentizer.config import DEFAULT_LOG_LEVEL, ModernBERTConfig
 from sentimentizer.tokenizer import vectorized_convert_ratings
 
 logger = new_logger(DEFAULT_LOG_LEVEL)
@@ -43,7 +43,9 @@ class HFTokenizer:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         return cls(tokenizer=tokenizer, model_name=model_name)
 
-    def tokenize_text(self, text: str, max_length: int = 512) -> dict[str, torch.Tensor]:
+    def tokenize_text(
+        self, text: str, max_length: int = ModernBERTConfig.max_seq_length
+    ) -> dict[str, torch.Tensor]:
         """Tokenize a single string."""
         encoded = self.tokenizer(
             text,
@@ -72,7 +74,7 @@ class HFTokenizer:
                     str(text),
                     padding=False,
                     truncation=True,
-                    max_length=512,
+                    max_length=ModernBERTConfig.max_seq_length,
                 )
                 input_ids.append(encoded["input_ids"])
                 attention_masks.append(encoded["attention_mask"])

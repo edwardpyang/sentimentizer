@@ -10,6 +10,8 @@ now use a single publish_epoch_metrics() function.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -61,6 +63,22 @@ _METRICS_DIR = Path("/tmp/sentimentizer_metrics")
 def get_metrics_dir() -> Path:
     """Return the directory used for per-model metrics JSON files."""
     return _METRICS_DIR
+
+
+def write_json_atomic(path: Path, data: dict[str, Any], *, indent: int | None = None) -> None:
+    """Replace *path* in one step so the exporter never reads a partial file."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=path.parent, prefix=f".{path.name}-", delete=False
+    ) as target:
+        temporary_path = Path(target.name)
+        try:
+            target.write(json.dumps(data, indent=indent))
+            target.close()
+            # NamedTemporaryFile is 0600; the exporter may run as another user.
+            os.chmod(temporary_path, 0o644)
+            temporary_path.replace(path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
 
 def write_batch_snapshot(
@@ -118,7 +136,7 @@ def write_batch_snapshot(
         data["throughput"] = float(throughput)
 
     with contextlib.suppress(OSError):
-        path.write_text(json.dumps(data))
+        write_json_atomic(path, data)
 
 
 def write_epoch_metrics_to_file(
@@ -191,7 +209,7 @@ def write_epoch_metrics_to_file(
     }
 
     with contextlib.suppress(OSError):
-        path.write_text(json.dumps(data, indent=2))
+        write_json_atomic(path, data, indent=2)
 
 
 # ──────────────────────────────────────────────

@@ -18,6 +18,7 @@ from sentimentizer.agent.loader import load_agent_config
 from sentimentizer.agent.models import AgentRunResult
 from sentimentizer.agent.nodes import analyze, decide, evaluate, tune
 from sentimentizer.agent.state import AgentState
+from sentimentizer.agent.websearch import reset_rate_limit
 from sentimentizer.config import DEFAULT_LOG_LEVEL
 
 logger = new_logger(DEFAULT_LOG_LEVEL)
@@ -146,6 +147,9 @@ async def run_agent_tuning(
         model_type=model_type,
         config_path=str(config_path) if config_path else "default",
     )
+
+    # The search budget is per run; without this it lasts for the process lifetime.
+    reset_rate_limit()
 
     # Run the graph
     final_state = await graph.ainvoke(initial_state)

@@ -27,9 +27,8 @@ spec:
               containerPort: 8000
               protocol: TCP
           env:
-            # Load only the models you need to reduce memory and startup time.
-            # Comma-separated list: rnn, encoder, decoder (default: all three).
-            - name: SENTIMENTIZER_MODELS
+            # Sentiment model to load: rnn, encoder, decoder, or modernbert.
+            - name: SENTIMENTIZER_DEFAULT_MODEL
               value: "encoder"
             - name: SENTIMENTIZER_EMBEDDINGS_ENABLED
               value: "false"

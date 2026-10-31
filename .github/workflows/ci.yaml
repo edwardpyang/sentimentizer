@@ -59,8 +59,27 @@ jobs:
     - name: test with pytest
       run: |
         uv run pytest --exitfirst --verbose --failed-first \
-          --cov=sentimentizer --cov=workflows \
-          --cov-report=term-missing --cov-report=html
+          --cov --cov-report=term-missing --cov-report=xml --cov-report=html
+
+    - name: publish coverage summary
+      run: |
+        {
+          echo "## Test coverage: $(uv run coverage report --format=total)%"
+          echo
+          echo "Line and branch coverage, least covered files first."
+          echo
+          uv run coverage report --format=markdown --sort=cover --skip-covered
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: upload coverage reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: |
+          coverage.xml
+          htmlcov/
+        if-no-files-found: error
+        retention-days: 14
 
   test-pandas-2:
     # pyproject allows pandas>=2.2.3, but uv.lock pins 3.x, so the job above

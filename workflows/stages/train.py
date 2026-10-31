@@ -8,7 +8,6 @@ of torch, ray, gensim, or sentimentizer.config here.
 from __future__ import annotations
 
 import contextlib
-import json
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +38,8 @@ def _reset_stale_metrics(model_type: str, run_id: str = "") -> None:
     them, leaving their gauges at whatever the last real training run set.
     """
     import time
+
+    from sentimentizer.metrics_publisher import write_json_atomic
 
     # --- 1. Persisted JSON files (zero all model types) ---
     try:
@@ -77,7 +78,7 @@ def _reset_stale_metrics(model_type: str, run_id: str = "") -> None:
                 },
             }
             path = _metrics_path(mt)
-            path.write_text(json.dumps(zeroed_metrics, indent=2))
+            write_json_atomic(path, zeroed_metrics, indent=2)
 
             # Also remove stale batch snapshot files so the exporter
             # doesn't serve intra-epoch data from a previous run.
@@ -681,6 +682,8 @@ def _persist_metrics_to_file(metrics: dict, model_type: str, run_id: str = "") -
     exporter discovers all files and zeroes out Prometheus gauges for
     any model type whose file is missing or stale.
     """
+    from sentimentizer.metrics_publisher import write_json_atomic
+
     _METRICS_DIR.mkdir(parents=True, exist_ok=True)
     path = _metrics_path(model_type)
 
@@ -726,5 +729,5 @@ def _persist_metrics_to_file(metrics: dict, model_type: str, run_id: str = "") -
         "_written_at": __import__("time").time(),
     }
 
-    path.write_text(json.dumps(data, indent=2))
+    write_json_atomic(path, data, indent=2)
     logger.info("training_metrics_persisted", path=str(path), model_type=model_type)

@@ -26,6 +26,7 @@ Usage::
 from __future__ import annotations
 
 import importlib.metadata
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -50,6 +51,8 @@ from sentimentizer.tokenizer import Tokenizer, get_trained_tokenizer, regex_toke
 # ---------------------------------------------------------------------------
 # Router imports (optional — sentence-transformers may not be installed)
 # ---------------------------------------------------------------------------
+
+_HF_MAX_SEQ_LENGTH = ModernBERTConfig.max_seq_length
 
 try:
     # router.config/model import lazily, so probe sentence_transformers
@@ -157,14 +160,7 @@ class SentimentPredictor:
             if not path.exists() and is_default:
                 logger.info(f"Router model not found at {path}, downloading from HF Hub...")
                 try:
-                    from huggingface_hub import snapshot_download
-
-                    from sentimentizer.config import HF_ROUTER_REPO
-
-                    snapshot_download(
-                        repo_id=HF_ROUTER_REPO,
-                        local_dir=str(path),
-                    )
+                    self._download_router_artifact(path)
                     logger.info(f"Router model downloaded to {path}")
                 except Exception:
                     logger.exception("Failed to download router model from HF Hub")
@@ -190,6 +186,27 @@ class SentimentPredictor:
         except Exception as exc:
             logger.exception("Failed to load router model")
             return None, str(exc)
+
+    @staticmethod
+    def _download_router_artifact(path: Path) -> None:
+        """Download the pinned router artifact, publishing it only once complete.
+
+        The download path doubles as the "already downloaded" marker, so a partial
+        directory left by an interrupted download would never be repaired.
+        """
+        from huggingface_hub import snapshot_download
+
+        from sentimentizer.config import HF_ROUTER_REPO, HF_ROUTER_REVISION
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=path.parent, prefix=f".{path.name}-") as staging:
+            staged = Path(staging) / path.name
+            snapshot_download(
+                repo_id=HF_ROUTER_REPO,
+                revision=HF_ROUTER_REVISION,
+                local_dir=str(staged),
+            )
+            staged.replace(path)
 
     def _ensure_router_loaded(self) -> None:
         """Lazily load the router model on first classify() call.
@@ -276,6 +293,13 @@ class SentimentPredictor:
             return self._router_error
 
     @property
+    def can_tokenize(self) -> bool:
+        """Whether a tokenizer is available; HF models only have the one they load with."""
+        return self.tokenizer is not None or (
+            self.model_loaded and getattr(type(self.model), "NEEDS_TOKENIZE_STAGE", True) is False
+        )
+
+    @property
     def model_error(self) -> str | None:
         """Error message if sentiment model failed to load, else None."""
         return self._model_error
@@ -328,7 +352,7 @@ class SentimentPredictor:
                 texts,
                 padding="longest",
                 truncation=True,
-                max_length=512,
+                max_length=_HF_MAX_SEQ_LENGTH,
                 return_tensors="pt",
             )
             probs = self.model.predict(encoded)
@@ -424,9 +448,14 @@ class SentimentPredictor:
 
         Returns:
             Dict with keys ``text``, ``tokens``, ``token_ids``, ``token_count``.
+
+        Raises:
+            RuntimeError: If the model that owns the tokenizer failed to load.
         """
+        if not self.can_tokenize:
+            raise RuntimeError(f"Tokenizer not available: {self._model_error}")
         if self.model_loaded and getattr(type(self.model), "NEEDS_TOKENIZE_STAGE", True) is False:
-            encoded = self.model.tokenizer(text, truncation=True, max_length=512)
+            encoded = self.model.tokenizer(text, truncation=True, max_length=_HF_MAX_SEQ_LENGTH)
             tokens = self.model.tokenizer.convert_ids_to_tokens(encoded["input_ids"])
             return {
                 "text": text,

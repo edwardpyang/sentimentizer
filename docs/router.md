@@ -210,6 +210,11 @@ make upload-router
 sentimentizer router push --model-path models/router --repo-id your-username/sentimentizer-router
 ```
 
+Serving only auto-downloads the commit pinned by `HF_ROUTER_REVISION` in
+`sentimentizer/config.py`, because the router head is a joblib pickle and loading it runs
+code from the artifact. After pushing a new default artifact, set that constant to the new
+commit hash, or deployments keep using the previous one.
+
 Run the whole pipeline (split → augment → train → evaluate) with `make router-pipeline`.
 
 The Makefile pipeline now requires labeled original sources at
