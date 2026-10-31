@@ -2,6 +2,13 @@
 
 **Status:** 📋 Not started — 2026-10-31
 
+**Direction update (2026-10-31):** The user wants a
+[generic classifier with food defaults](generic-router-plan.md) first, with
+chemistry as a possible later use. Defer the chemistry modules, configuration,
+episode endpoints, and outcome rules below. A future chemistry integration can
+reuse the generic model with its own configuration, training data, and trace
+formatter. This document remains context for that future integration.
+
 ## Goal and user requirements
 
 Classify the chemistry task an agent actually performed, and associate it with

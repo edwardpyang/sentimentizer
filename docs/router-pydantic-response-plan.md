@@ -2,6 +2,13 @@
 
 **Status:** 📋 Not started — 2026-10-31
 
+**Direction update (2026-10-31):** Follow the
+[generic router plan](generic-router-plan.md) for implementation. The shared
+classifier will use artifact-defined labels with food-review defaults, rather
+than the fixed RouteCategory enum and mandatory three-label mapping below.
+The response envelopes, bounds, batch checks, and producer fixes remain useful;
+the newer plan resolves conflicts. This document retains the original review.
+
 ## Goal
 
 Make the intent router's existing JSON responses match explicit, validated
