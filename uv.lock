@@ -3783,7 +3783,7 @@ requires-dist = [
     { name = "onnxscript", marker = "extra == 'onnx'" },
     { name = "optuna", marker = "extra == 'ray'", specifier = ">=4.8.0" },
     { name = "orjson", specifier = ">=3.11.0" },
-    { name = "pandas", specifier = ">=3.0.0" },
+    { name = "pandas", specifier = ">=2.2.3" },
     { name = "pillow", marker = "extra == 'diffusion'", specifier = ">=12.0.0" },
     { name = "pip-tools", marker = "extra == 'dev'" },
     { name = "prometheus-client", specifier = ">=0.25.0" },
