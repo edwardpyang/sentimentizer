@@ -5,8 +5,10 @@
 ## Goal
 
 Move headless image generation (Krea 2 / Ideogram 4 via the ComfyUI sidecar)
-out of `sentimentizer` into its own repository and deployable service, with
-**unchanged public behavior**: same `/v1/images/*` routes, request/response
+out of `sentimentizer` into its own repository and deployable service,
+**`imagenate`**. Image generation is unrelated to sentiment analysis, so the
+new service carries no sentimentizer naming. Client-facing behavior is
+**unchanged**: same `/v1/images/*` routes, request/response
 shapes, error codes, auth, rate limiting, idempotency, async jobs, licensing
 gates, and moderation. The new service keeps Ray Serve for this migration so
 that any behavior difference can be attributed to the move itself; removing
@@ -21,6 +23,8 @@ Ray is a separate, later change (see [Follow-up](#follow-up-drop-ray-serve)).
 - A standalone entry point, config, health/metrics routes, packaging, CI,
   container image, and Kubernetes manifests for the new service.
 - An OpenAPI parity check between the old and new `/v1/images` apps.
+- Renaming the service's environment variables from `SENTIMENTIZER_*` to
+  `IMAGENATE_*` (see [Environment variable rename](#environment-variable-rename)).
 - Ingress cutover of `/v1/images` to the new service.
 - Removal of all image code, config, tests, the `diffusion` extra, and docs
   from `sentimentizer` **after** cutover is verified.
@@ -29,21 +33,23 @@ Ray is a separate, later change (see [Follow-up](#follow-up-drop-ray-serve)).
 
 - Dropping Ray Serve, replacing the in-memory `JobStore`, or any change to
   ComfyUI workflows, checkpoints, models, or licensing gates.
-- Renaming `SENTIMENTIZER_*` environment variables (decision D3).
+- Moving to a separate hostname (D5). Cutover keeps `/v1/images` on the
+  current host; a hostname change is a later, client-visible step.
 - Changing sentiment, router, or embeddings behavior. The only sentiment-side
   behavior change is that `/health/ready` no longer reports image backends.
 - Fixing pre-existing issues found during discovery (listed under
   [Pre-existing issues](#pre-existing-issues-found-during-discovery)); each is
   noted where it affects the migration.
 
-## Decisions required before Milestone 1
+## Decisions
 
-| ID | Decision | Recommendation |
+| ID | Decision | Status |
 |---|---|---|
-| D1 | New repo and package name | `sentimentizer-images` / `sentimentizer_images`. Used as a placeholder below. |
-| D2 | Where the service runs | Its own container/pod. Required if it shares a host with sentiment training (see risks R1, R2). |
-| D3 | Env var prefix | Keep `SENTIMENTIZER_*` names unchanged for parity, so existing deployment env works as-is. Rename in a later change if wanted. |
-| D4 | Layout in the new repo | Mirror the current paths (`sentimentizer_images/diffusion/*`, `sentimentizer_images/serve/*`) so Milestone 1 is a mechanical rename. Reorganize later. |
+| D1 | Repo and package name | **Decided:** `imagenate` for both the GitHub repo and the Python package. Free on PyPI and in your GitHub account (checked 2026-10-31). |
+| D2 | Where the service runs | Recommended: its own container/pod. Required if it shares a host with sentiment training (see risks R1, R2). |
+| D3 | Env var prefix | **Decided:** rename `SENTIMENTIZER_*` to `IMAGENATE_*` during the move, with no backward-compatible aliases. Cutover writes fresh deployment config for the new service anyway, and parity is about the client API, not config names. |
+| D4 | Layout in the new repo | Recommended: mirror the current paths (`imagenate/diffusion/*`, `imagenate/serve/*`) so Milestone 1 is a mechanical rename. Reorganize later. |
+| D5 | Hostname | Recommended: cut over on the current host's `/v1/images` path so clients see no change. Move to a dedicated hostname (e.g. `images.example.com`) in a later change, with a redirect or deprecation window. |
 
 ## Current state (verified 2026-10-31 against `main` @ 2d90b50)
 
@@ -64,12 +70,12 @@ Ray is a separate, later change (see [Follow-up](#follow-up-drop-ray-serve)).
 
 | Dependency | Defined in | Copy as |
 |---|---|---|
-| `create_fastapi_app()`, `_RequestBodySizeLimitMiddleware`, `http_exception_handler`, `_status_code_to_error_code` | `serve/app.py` (~150 lines) | `sentimentizer_images/serve/http.py` |
-| `ServiceMetrics`, `render_service_metrics`, `serve` import | `serve/base.py` | `sentimentizer_images/serve/base.py` (drop `_DummyServe`; Ray is a hard dependency there) |
-| `is_safe`, `NSFW_BLOCKLIST`, `INJECTION_PATTERNS` | `safety.py` (70 lines) | `sentimentizer_images/safety.py`. `sentimentizer` keeps its copy because `agent/websearch.py` uses `INJECTION_PATTERNS`. |
-| `logger` | `sentimentizer/__init__.py` | Minimal structlog setup in `sentimentizer_images/__init__.py` |
+| `create_fastapi_app()`, `_RequestBodySizeLimitMiddleware`, `http_exception_handler`, `_status_code_to_error_code` | `serve/app.py` (~150 lines) | `imagenate/serve/http.py` |
+| `ServiceMetrics`, `render_service_metrics`, `serve` import | `serve/base.py` | `imagenate/serve/base.py` (drop `_DummyServe`; Ray is a hard dependency there) |
+| `is_safe`, `NSFW_BLOCKLIST`, `INJECTION_PATTERNS` | `safety.py` (70 lines) | `imagenate/safety.py`. `sentimentizer` keeps its copy because `agent/websearch.py` uses `INJECTION_PATTERNS`. |
+| `logger` | `sentimentizer/__init__.py` | Minimal structlog setup in `imagenate/__init__.py` |
 | Image fields of `ServeConfig` + validation + env map | `serve/config.py` | `ImagesConfig` (see Public interfaces) |
-| `SENTIMENTIZER_API_KEYS` env export | `serve/app.py:119-120` (module level) | Same statement at module level in the new entry module. Without it every request returns 401 (R6). |
+| API-key env export (`SENTIMENTIZER_API_KEYS`) | `serve/app.py:119-120` (module level) | Same statement at module level in the new entry module, exporting `IMAGENATE_API_KEYS`. `middleware.py` reads the env name directly, so rename it in both places together. Without it every request returns 401 (R6). |
 
 **Why `diffusion_app.py` currently needs torch:** it imports
 `create_fastapi_app` from `serve/app.py`, which imports `SentimentPredictor`
@@ -105,7 +111,7 @@ package would couple two release cycles to save about 300 lines.
 ## Architecture (new repository)
 
 ```
-sentimentizer-images/
+imagenate/
   pyproject.toml                      NEW  deps: fastapi==0.136.1, ray[serve]>=2.55.1,<2.56.0,
                                            pillow, orjson, pyyaml, structlog, pydantic; dev: ruff, pyright, pytest
   Makefile                            NEW  check / typecheck / test / ci / serve (mirrors sentimentizer targets)
@@ -115,7 +121,7 @@ sentimentizer-images/
   .github/workflows/ci.yaml           NEW  ruff format --check, ruff check, pyright, pytest; permissions: contents: read
   k8s/                                NEW  deployment, service, ingress (path /v1/images, proxy-body-size 4m), pdb
   docs/                               MOVED serving (image section), configuration (image section), historical plans
-  sentimentizer_images/
+  imagenate/
     __init__.py                       NEW  structlog logger
     __main__.py                       NEW  CLI: --host, --port, --config
     safety.py                         COPY
@@ -156,8 +162,8 @@ models, status codes, error codes, and headers:
 
 Also unchanged: Bearer auth, `Idempotency-Key`, the rate-limit headers, the
 4 MiB body limit, `X-Request-Id`, the `{"error": {"code", "message"}}`
-envelope, and every `SENTIMENTIZER_*` env var listed in `docs/configuration.md`
-for images. The images app is still served by Ray Serve with
+envelope. Configuration *values* and semantics are unchanged; only the env var
+names change (D3). The images app is still served by Ray Serve with
 `route_prefix="/v1/images"`, so `request.scope["root_path"]` (used to build
 `Location`) is unchanged.
 
@@ -173,12 +179,12 @@ small Serve app at `route_prefix="/"` with:
 | `GET /health/live` | 200 `{"status": "live", "uptime_s": ...}`, the same shape as sentimentizer's. |
 | `GET /health/ready` | 200 when ComfyUI `system_stats` succeeds and the `diffusion_job_store` actor resolves. Otherwise 503 with `image_models` and `image_backend_error`, the same keys sentiment reports today. |
 | `GET /health` | Alias for `/health/ready`, as in sentimentizer. |
-| `GET /metrics` | `render_service_metrics(..., service_prefix="sentimentizer_images")` over the dispatcher's collectors. |
+| `GET /metrics` | `render_service_metrics(..., service_prefix="imagenate")` over the dispatcher's collectors. |
 
 **Entry point.**
 
 ```python
-# sentimentizer_images/serve/app.py
+# imagenate/serve/app.py
 os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "false")  # module level, before `import ray`
 
 def main(host: str | None = None, port: int | None = None) -> None: ...
@@ -186,7 +192,7 @@ def main(host: str | None = None, port: int | None = None) -> None: ...
 
 `main()` reproduces the image half of today's `sentimentizer.serve.app.main`:
 
-1. `ray.init(address="local", namespace="sentimentizer_images", runtime_env={"py_executable": sys.executable})`.
+1. `ray.init(address="local", namespace="imagenate", runtime_env={"py_executable": sys.executable})`.
 2. `serve.start(http_options=HTTPOptions(host=..., port=..., request_timeout_s=cfg.request_timeout_s))`. A plain dict would silently drop the timeout.
 3. Create the detached `JobStore` actor `diffusion_job_store`.
 4. `serve.run(ImagesDispatcher.bind(...), name="images", route_prefix="/v1/images")` and `serve.run(OpsDeployment.bind(...), name="ops", route_prefix="/")`.
@@ -197,7 +203,7 @@ It also raises the same `ValueError` when no image model is enabled.
 `address="local"` is required. Without it, `ray.init()` joins any Ray cluster
 recorded in `/tmp/ray/ray_current_cluster` on the host (R1).
 
-CLI: `python -m sentimentizer_images [--host H] [--port P] [--config PATH]`.
+CLI: `python -m imagenate [--host H] [--port P] [--config PATH]`.
 Default port is **8001**, so it can run beside sentiment on one host during
 cutover. There is no `--diffusion` flag; the service only does images.
 
@@ -234,15 +240,34 @@ def load_images_config(path: str | Path | None = None) -> ImagesConfig: ...
 Defaults, the `__post_init__` validation (licensing gates, Krea moderation
 requirement, temp-directory requirement, default-model-enabled check, URL
 scheme, positive timeouts), env var names, and parsing are moved verbatim from
-`ServeConfig`. The config path env var is `SENTIMENTIZER_IMAGES_SERVE_CONFIG`,
-a new name so the two services' config files can't be confused.
-`SENTIMENTIZER_SERVE_HOST` / `_PORT` are shared names; on a shared host, set
-ports per service with `--port` (R8). `prompt_blocklist_path` is dropped: it is
-declared but never read anywhere.
+`ServeConfig`; env var names follow the
+[rename table](#environment-variable-rename). The config path env var is
+`IMAGENATE_SERVE_CONFIG`. `prompt_blocklist_path` is dropped: it is declared but
+never read anywhere.
 
 `middleware._get_limiter()` currently calls
 `sentimentizer.serve.config.load_serve_config()`. Re-point it to
 `load_images_config()`.
+
+### Environment variable rename
+
+Rule: replace the `SENTIMENTIZER_` prefix with `IMAGENATE_`, keeping the rest of
+the name. For example, `SENTIMENTIZER_KREA_2_ENABLED` becomes
+`IMAGENATE_KREA_2_ENABLED`.
+
+| Today | In imagenate |
+|---|---|
+| `SENTIMENTIZER_KREA_2_ENABLED`, `_KREA_2_LICENSE_ACCEPTED`, `_IDEOGRAM_4_ENABLED`, `_IDEOGRAM_4_LICENSE_ACCEPTED` | `IMAGENATE_` + same suffix |
+| `SENTIMENTIZER_COMFYUI_BASE_URL`, `_COMFYUI_TIMEOUT_S`, `_COMFYUI_POLL_INTERVAL_S`, `_COMFYUI_TEMP_DIRECTORY` | `IMAGENATE_` + same suffix |
+| `SENTIMENTIZER_IMAGE_MODERATION_URL`, `_IMAGE_MODERATION_API_KEY`, `_IMAGE_MODERATION_TIMEOUT_S`, `_DEFAULT_IMAGE_MODEL` | `IMAGENATE_` + same suffix |
+| `SENTIMENTIZER_API_KEYS`, `_RATE_LIMIT_PER_MIN`, `_RATE_LIMIT_BURST`, `_IDEMPOTENCY_TTL_S`, `_JOB_TTL_S` | `IMAGENATE_` + same suffix |
+| `SENTIMENTIZER_SERVE_HOST`, `_SERVE_PORT`, `_CORS_ORIGINS`, `_REQUEST_TIMEOUT_S` (shared with sentiment today) | `IMAGENATE_` + same suffix; sentimentizer keeps its own |
+| `SENTIMENTIZER_DIFFUSION_{KREA_2,IDEOGRAM_4}_<FIELD>` (`diffusion/config.py`) | `IMAGENATE_DIFFUSION_{KREA_2,IDEOGRAM_4}_<FIELD>` |
+| `SENTIMENTIZER_SERVE_CONFIG` (config file path) | `IMAGENATE_SERVE_CONFIG` |
+| `SENTIMENTIZER_DIFFUSION_ENABLED`, `SENTIMENTIZER_PROMPT_BLOCKLIST_PATH` | Not carried over. The service always serves images, and the blocklist path was never read. |
+
+The new `docs/configuration.md` in imagenate carries this table, so operators
+can translate existing deployment config at cutover.
 
 ### Changed in sentimentizer
 
@@ -252,7 +277,7 @@ declared but never read anywhere.
 | `SentimentizerDeployment.__init__(embeddings_handle=None, image_model_names=None)` | `__init__(embeddings_handle=None)` | 1 bind in `main`; 2 test fixtures |
 | `ServeConfig` with 18 image fields | Without them | Readers: `diffusion_app.py`, `middleware.py`, `app.py` (all removed or edited above); `tests/test_comfyui.py` (moves) |
 | `GET /health/ready` includes `image_models` / `image_backend_error` when images enabled | Never includes them | — |
-| `python -m sentimentizer.serve --diffusion` | Exits 2 with "image generation moved to sentimentizer-images; see docs/serving.md" | `Makefile` `serve-all` (removed) |
+| `python -m sentimentizer.serve --diffusion` | Exits 2 with "image generation moved to the imagenate service; see docs/serving.md" | `Makefile` `serve-all` (removed) |
 
 ## Implementation order
 
@@ -272,12 +297,12 @@ documentation-only steps use `git diff --check` instead, per AGENTS.md.
      --path tests/test_comfyui.py --path tests/test_diffusion_jobs.py --path tests/test_middleware.py \
      --path docs/diffusion_serving_plan.md --path docs/flux2_reference_image_plan.md \
      --path docs/mlx_diffusion_plan.md \
-     --path-rename sentimentizer/:sentimentizer_images/
+     --path-rename sentimentizer/:imagenate/
    ```
-2. Rewrite imports from `sentimentizer.` to `sentimentizer_images.`.
+2. Rewrite imports from `sentimentizer.` to `imagenate.`.
 3. Add the copied `serve/http.py`, `serve/base.py`, and the logger.
 4. Add `pyproject.toml`, `Makefile`, ruff/pyright/pytest config copied from sentimentizer, and CI.
-5. Move `TestRequestBodySizeLimitMiddleware` out of the moved `test_middleware.py` into `tests/test_http.py`, re-pointed at `sentimentizer_images.serve.http`.
+5. Move `TestRequestBodySizeLimitMiddleware` out of the moved `test_middleware.py` into `tests/test_http.py`, re-pointed at `imagenate.serve.http`.
 6. Port `TestGenerateRequestValidation` and `TestRateLimiterAndAuth` into new test files.
 
 **Gate:** `make ci` green; the moved tests are the same test count as in
@@ -287,8 +312,10 @@ sentimentizer (23 + 22 + the 6 `test_middleware.py` classes + the 2 ported class
 
 1. Add `ImagesConfig` / `load_images_config()` and `service.yaml`. Move the licensing-gate tests in `test_comfyui.py` from `ServeConfig` to `ImagesConfig`.
 2. Re-point `diffusion_app.py` and `middleware.py` from `sentimentizer.serve.config` to the new config.
-3. Add `serve/app.py` with module-level env setup, the `SENTIMENTIZER_API_KEYS` export, `main()`, and the ops deployment.
-4. Add `__main__.py`.
+3. Rename env vars per the [rename table](#environment-variable-rename): `ImagesConfig`'s env map, `diffusion/config.py` (`SENTIMENTIZER_DIFFUSION_` prefix), `middleware.py` (`SENTIMENTIZER_API_KEYS`, read twice), and the moved tests (`test_middleware.py` sets `SENTIMENTIZER_API_KEYS` in 16 places). Add the startup warning for old names (R8).
+4. Add `serve/app.py` with module-level env setup, the `IMAGENATE_API_KEYS` export, `main()`, and the ops deployment.
+5. Add `__main__.py`.
+6. Add a CI step that fails if the string `SENTIMENTIZER_` appears in `imagenate/` outside the old-name warning list.
 
 **Gate:** `make ci` green, including the new `test_config.py`,
 `test_ops_routes.py`, and `test_entrypoint.py`.
@@ -302,7 +329,7 @@ sentimentizer (23 + 22 + the 6 `test_middleware.py` classes + the 2 ported class
    ```
    Commit the output to the new repo as `tests/fixtures/images_openapi.json`.
 2. Add `test_openapi_parity.py`, which compares the new `images_app.openapi()` with the snapshot. It ignores `info.title`, `info.version`, and `info.description`, and the new ops routes, which live on a separate app.
-3. Smoke test: run sentimentizer `--diffusion` on port 8000 and the new service on 8001 against the same ComfyUI. Send the same request set to both: generate, create/get/list/cancel job, models, auth failure, rate limit, idempotency conflict, oversized body, unsafe prompt. Compare status codes and response keys.
+3. Smoke test: run sentimentizer `--diffusion` on port 8000 and the new service on 8001 against the same ComfyUI, with the same config values under each service's env names. Send the same request set to both: generate, create/get/list/cancel job, models, auth failure, rate limit, idempotency conflict, oversized body, unsafe prompt. Compare status codes and response keys.
 
 **Gate:** parity test green; smoke results match (image bytes will differ
 unless `seed` is fixed, so fix it).
@@ -319,7 +346,7 @@ running ComfyUI.
 
 ### M5. Cutover (ops, no code)
 
-1. Deploy the new service with the same `SENTIMENTIZER_*` image env and secrets as the current sentiment deployment.
+1. Deploy the new service with the current image config translated to `IMAGENATE_*` names per the rename table, and the same secret values (API keys, moderation key).
 2. Add the `/v1/images` ingress rule. NGINX ingress picks the longest matching Prefix path, so it takes precedence over `/`.
 3. Verify through the public host: `/v1/images/models` and one `generate`.
 4. Disable images in sentimentizer by unsetting `SENTIMENTIZER_KREA_2_ENABLED` / `SENTIMENTIZER_IDEOGRAM_4_ENABLED` and `--diffusion`, then redeploy it.
@@ -366,9 +393,9 @@ Only after M5 has run cleanly for an agreed soak period.
 | `test_middleware.py` (new, moved) | Auth, token bucket, idempotency cache, prompt safety, error-envelope integration. |
 | `test_http.py` (new, copied) | Per-path body-size limits in the copied `create_fastapi_app`. |
 | `test_generate_request.py`, `test_auth_rate_limit.py` (new) | Classes ported from `test_serve.py`. |
-| `test_config.py` (new) | Every `ImagesConfig` validation error. Env override and type coercion for each field. `SENTIMENTIZER_IMAGES_SERVE_CONFIG` path precedence. |
+| `test_config.py` (new) | Every `ImagesConfig` validation error. Env override and type coercion for each field. `IMAGENATE_SERVE_CONFIG` path precedence. Old `SENTIMENTIZER_*` names are ignored and produce one warning each. |
 | `test_ops_routes.py` (new) | `/health/live`; `/health/ready` 200 and 503 (ComfyUI down; job store missing) with the expected keys; `/metrics` prefix and counters. |
-| `test_entrypoint.py` (new) | `RAY_ENABLE_UV_RUN_RUNTIME_ENV` set at import; `SENTIMENTIZER_API_KEYS` exported from config; `main()` calls `ray.init(address="local", ...)` and `HTTPOptions(request_timeout_s=...)` (mock `ray`/`serve`); `ValueError` when no model is enabled. |
+| `test_entrypoint.py` (new) | `RAY_ENABLE_UV_RUN_RUNTIME_ENV` set at import; `IMAGENATE_API_KEYS` exported from config; `main()` calls `ray.init(address="local", ...)` and `HTTPOptions(request_timeout_s=...)` (mock `ray`/`serve`); `ValueError` when no model is enabled. |
 | `test_openapi_parity.py` (new) | `/v1/images` OpenAPI schema equals the snapshot taken from sentimentizer. |
 | `test_serve.py` (sentimentizer) | Fixtures without image attributes; `/health/ready` without image keys. |
 | `test_bge_only_serve.py`, next to the existing `build_parser` tests (sentimentizer) | `--diffusion` and `SENTIMENTIZER_DIFFUSION_ENABLED` exit non-zero with the pointer message. |
@@ -383,9 +410,9 @@ Only after M5 has run cleanly for an agreed soak period.
 | R3 | **Readiness gap.** Today image readiness is reported only through sentiment's `/health/ready`; the images app has no health routes. | New ops app (M2), probes (M4). |
 | R4 | **API drift during the move.** | Golden OpenAPI snapshot (M3) plus a side-by-side smoke run. |
 | R5 | **Body-size mismatch at the edge.** The images app accepts 4 MiB, but the shared ingress caps all paths at `1m`. | The new ingress sets `4m` for `/v1/images` (M4). This is a pre-existing mismatch, so the new limit is deliberately the app's intended one. Confirm with the owner. |
-| R6 | **Auth breaks silently.** `require_api_key` reads `SENTIMENTIZER_API_KEYS` from the process env, which `serve/app.py` populates from config at import time. Missing that export makes every request 401. | Same module-level export in the new `serve/app.py`; `test_entrypoint.py` asserts it. |
+| R6 | **Auth breaks silently.** `require_api_key` reads the API-key env var from the process env, which `serve/app.py` populates from config at import time. Missing that export, or renaming it in only one of the two places, makes every request 401. | Same module-level export (`IMAGENATE_API_KEYS`) in the new `serve/app.py`; `test_entrypoint.py` and the moved `test_middleware.py` cover it. |
 | R7 | **Images disappear silently after M6.** Operators still setting `SENTIMENTIZER_KREA_2_ENABLED` or passing `--diffusion` would start sentiment without images and no error. | `--diffusion` exits non-zero with a pointer. Legacy image env vars warn at startup. Keep both for one release. |
-| R8 | **Shared env names collide on one host.** `SENTIMENTIZER_SERVE_PORT` / `_HOST` would configure both services. | Default image port 8001; set ports per service by CLI flag; separate config-path env var. |
+| R8 | **Old env names are ignored.** An operator who copies the current deployment env to the new service unchanged gets every image model disabled. `main()` then refuses to start with the existing "requires an explicitly enabled image model" error, which doesn't point at the rename. | The rename is listed in the cutover steps (M5). At startup, before that check, `imagenate` logs one warning per old `SENTIMENTIZER_*` name from the rename table that is set, for one release, so the cause is obvious. Separate prefixes also mean the two services can't pick up each other's host or port settings on a shared host. |
 | R9 | **`Location` header prefix.** `create_job` builds `Location` from `request.scope["root_path"]`. | Keep `route_prefix="/v1/images"` on Ray Serve; covered by the smoke run. |
 | R10 | **Lost async jobs at cutover.** | Accept and document (M5). |
 | R11 | **Request timeout dropped.** `http_options={"request_timeout_s": ...}` is silently ignored. | Use `HTTPOptions` (asserted in `test_entrypoint.py`). |
@@ -421,7 +448,7 @@ optional keys.
   - Add a one-line pointer to the new repo.
 - **`.rules/observability.md`:** drop ComfyUI from the external-call examples.
 - **`.rules/prompts-and-constants.md`:** remove the diffusion constants entry.
-- **New repo `AGENTS.md`:** carries the moved "Headless image generation" section, the relevant Serving API bullets (`HTTPOptions`, trailing slashes, separate FastAPI app per deployment, no `__call__`), the `RAY_ENABLE_UV_RUN_RUNTIME_ENV` rule, and R1/R2 as operating rules.
+- **New repo `AGENTS.md`:** states the `IMAGENATE_*` env prefix and carries the moved "Headless image generation" section, the relevant Serving API bullets (`HTTPOptions`, trailing slashes, separate FastAPI app per deployment, no `__call__`), the `RAY_ENABLE_UV_RUN_RUNTIME_ENV` rule, and R1/R2 as operating rules.
 - **`docs/troubleshooting.md` (sentimentizer):** note R2 (training's Ray cleanup kills other Ray processes on the host).
 
 ## Pre-existing issues found during discovery
@@ -456,6 +483,16 @@ sentimentizer because `test_middleware.py` imports the deleted module.
 through `ImagesConfig` in M2. Corrected the `/health/live` shape to match
 sentimentizer's (`"live"` plus `uptime_s`). No unresolved gaps remain that would block implementation.
 
+**Pass 3 (naming decisions, 2026-10-31).** D1 settled on `imagenate`, and D3
+changed from keeping `SENTIMENTIZER_*` to renaming during the move, because the
+service is unrelated to sentiment. Review of that change:
+
+- (a) The API-key env name is read in `middleware.py` as well as exported in `serve/app.py`; both must change together (R6).
+- (b) `diffusion/config.py` builds `SENTIMENTIZER_DIFFUSION_*` names, which are easy to miss with a field-by-field rename. Covered by the CI string check in M2.
+- (c) Copying the old env unchanged would leave every model disabled, and startup would fail with an error that doesn't mention the rename. Added the old-name startup warning and the cutover translation step (R8, M5).
+- (d) The old R8 (shared host/port names colliding on one host) no longer applies once the prefixes differ.
+- (e) Added D5 so the hostname move stays out of the cutover.
+
 ## Follow-up: drop Ray Serve
 
 After the new service has run in production, this becomes a separate plan.
@@ -472,7 +509,7 @@ R1, R2, R11 and R12 go away with it. Estimated at 3-4 days.
 | Milestone | Repo | Estimate |
 |---|---|---|
 | M1 Bootstrap with history | new | 0.5-1 day |
-| M2 Config and entry point | new | 0.5 day |
+| M2 Config, env rename and entry point | new | 0.5-0.75 day |
 | M3 Parity check | both | 0.5 day |
 | M4 Packaging and deployment | new | 0.5-1 day |
 | M5 Cutover | ops | under 1 hour plus soak time |
