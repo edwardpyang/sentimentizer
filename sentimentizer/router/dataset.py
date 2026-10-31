@@ -61,11 +61,97 @@ def dataset_fingerprint(records: list[dict]) -> str:
         (
             text_key(row["text"]),
             int(row["label"]) if isinstance(row["label"], Integral) else row["label"],
-            str(row.get("group_id", "")),
+            str(row["group_id"]) if row.get("group_id") is not None else "",
         )
         for row in records
     )
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+
+
+def records_to_columns(records: list[dict]) -> dict[str, list]:
+    """Preserve every optional field, filling missing entries with nulls."""
+    keys = sorted({key for row in records for key in row})
+    return {key: [row.get(key) for row in records] for key in keys}
+
+
+def records_to_dataset(records: list[dict]) -> "Dataset":
+    """Build a dataset without allowing the first row to define its columns."""
+    from datasets import Dataset
+
+    return Dataset.from_dict(records_to_columns(records))
+
+
+def _label_aware_split(
+    groups: list[int], labels: list[int], test_size: float, seed: int
+) -> tuple[list[int], list[int]]:
+    """Find a class-complete group assignment when random candidates miss one.
+
+    Binary variables assign whole connected groups to test. Coverage constraints
+    require at least one group for each class on each side; slack variables
+    minimize deviation from the requested row and per-class counts. Solver
+    failure is distinguished from a proof that the constraints are infeasible.
+    """
+    import numpy as np
+    from scipy.optimize import Bounds, LinearConstraint, milp
+    from scipy.sparse import coo_matrix, csr_matrix, eye, hstack, vstack
+
+    group_ids = np.random.default_rng(seed).permutation(sorted(set(groups))).tolist()
+    group_columns = {group: column for column, group in enumerate(group_ids)}
+    label_rows = {label: row for row, label in enumerate(sorted(set(labels)))}
+    num_groups, num_labels = len(group_ids), len(label_rows)
+    counts = coo_matrix(
+        (
+            np.ones(len(labels)),
+            ([label_rows[label] for label in labels], [group_columns[group] for group in groups]),
+        ),
+        shape=(num_labels, num_groups),
+    ).tocsr()
+    support = counts.copy()
+    support.data[:] = 1
+    class_sizes = np.asarray(counts.sum(axis=1)).ravel()
+    group_sizes = np.asarray(counts.sum(axis=0)).ravel()
+    totals = np.r_[len(labels), class_sizes]
+    count_rows = vstack([csr_matrix(group_sizes[None, :]), counts])
+    slack = eye(num_labels + 1)
+    matrix = vstack(
+        [
+            hstack([support, csr_matrix((num_labels, num_labels + 1))]),
+            hstack([count_rows, -slack]),
+            hstack([-count_rows, -slack]),
+        ]
+    )
+    targets = test_size * totals
+    result = milp(
+        # Prioritize the requested number of rows; class balance breaks ties.
+        c=np.r_[np.zeros(num_groups), 1.0, 1.0 / (len(labels) * class_sizes)],
+        integrality=np.r_[np.ones(num_groups), np.zeros(num_labels + 1)],
+        bounds=Bounds(
+            np.zeros(num_groups + num_labels + 1),
+            np.r_[np.ones(num_groups), np.full(num_labels + 1, np.inf)],
+        ),
+        constraints=LinearConstraint(
+            matrix,
+            np.r_[np.ones(num_labels), np.full(2 * (num_labels + 1), -np.inf)],
+            np.r_[np.asarray(support.sum(axis=1)).ravel() - 1, targets, -targets],
+        ),
+    )
+    if result.status == 2:
+        raise ValueError(
+            "Cannot preserve every class in both group-disjoint splits; "
+            "source-group constraints are infeasible"
+        )
+    if not result.success or result.x is None:
+        raise RuntimeError(
+            f"Router grouped split solver failed (status={result.status}); feasibility is unknown"
+        )
+    selected = {
+        group for group, value in zip(group_ids, result.x[:num_groups], strict=True) if value >= 0.5
+    }
+    train = [index for index, group in enumerate(groups) if group not in selected]
+    test = [index for index, group in enumerate(groups) if group in selected]
+    if any({labels[index] for index in indices} != set(labels) for indices in (train, test)):
+        raise RuntimeError("Router grouped split solver returned an invalid class assignment")
+    return train, test
 
 
 def split_router_records(
@@ -127,11 +213,11 @@ def split_router_records(
         if best is None or score < best[0]:
             best = (score, train_ids.tolist(), test_ids.tolist())
     if best is None:
-        raise ValueError(
-            "Cannot preserve every class in both group-disjoint splits; "
-            "add independent sources per class or adjust split sizes"
-        )
-    train, test = ([records[i] for i in indices] for indices in best[1:])
+        logger.info("Random candidates missed class coverage; solving source-group constraints")
+        indices = _label_aware_split(groups, [row["label"] for row in records], test_size, seed)
+    else:
+        indices = best[1:]
+    train, test = ([records[i] for i in partition] for partition in indices)
     assert_disjoint(train, test)
     if any(row.get("group_id") is None for row in records):
         logger.warning("Missing source group_id: only exact duplicate leakage can be checked")
@@ -177,11 +263,9 @@ def load_router_dataset(
     Returns:
         Tuple of (train_dataset, test_dataset).
     """
-    from datasets import Dataset
-
     train, test = split_router_records(load_router_records(data_path), test_size, seed)
     logger.info(f"Loaded router dataset from {data_path}: {len(train)} train, {len(test)} test")
-    return Dataset.from_list(train), Dataset.from_list(test)
+    return records_to_dataset(train), records_to_dataset(test)
 
 
 def save_dataset_to_jsonl(

@@ -291,6 +291,8 @@ required after any dashboard change.
   accept/abstain separately from the topic label. Classification responses stay
   compatible. Decision endpoints require a saved acceptance policy. Failed
   operating targets produce abstain-all; no threshold implies no acceptance.
+  Use `records_to_dataset()`/`records_to_columns()` for heterogeneous records;
+  `Dataset.from_list()` can silently drop fields absent from the first row.
 - **FastAPI + `@serve.ingress`, one app per deployment.** There is **no mounted
   `v1` sub-app** — routes declare their full path on the app returned by
   `create_fastapi_app()`, e.g. `@app.post("/v1/sentiment/predict")`. Health

@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 from sentimentizer.router.config import RouterConfig
-from sentimentizer.router.dataset import assert_disjoint, dataset_fingerprint
+from sentimentizer.router.dataset import assert_disjoint, dataset_fingerprint, records_to_columns
 from sentimentizer.router.evaluate import evaluate_router, prediction_metrics
 from sentimentizer.router.provenance import library_versions
 
@@ -132,9 +132,11 @@ def benchmark_router(
         before = process.memory_info().rss
         started = time.monotonic()
         run_config = replace(config, training_mode=mode, output_dir=config.output_dir / mode)
-        model = train_router(run_config, _columns(train_records), _columns(validation_records))
+        model = train_router(
+            run_config, records_to_columns(train_records), records_to_columns(validation_records)
+        )
         duration = time.monotonic() - started
-        metrics = evaluate_router(model, _columns(test_records))
+        metrics = evaluate_router(model, records_to_columns(test_records))
         metrics["similarity_matrix"] = metrics["similarity_matrix"].tolist()
         report["runs"][mode] = {
             **metrics,
@@ -150,11 +152,3 @@ def benchmark_router(
         gc.collect()
     (config.output_dir / "benchmark_report.json").write_text(json.dumps(report, indent=2))
     return report
-
-
-def _columns(records: list[dict]) -> dict[str, list]:
-    """Keep optional source metadata aligned when converting records to columns."""
-    return {
-        key: [row.get(key) for row in records]
-        for key in set().union(*(row.keys() for row in records))
-    }

@@ -264,6 +264,12 @@ The default split reserves 20% each for validation/test; optional calibration an
 policy fractions are additional. Fractions are approximate for unequal groups.
 The splitter connects source groups linked by duplicate texts, rejects conflicting
 duplicate labels, and fails when it cannot retain every class in each split.
+If random candidates miss rare classes, a constrained group assignment checks
+coverage directly instead of treating missed samples as proof of infeasibility.
+The fallback prioritizes the requested row count and then class balance; genuine
+infeasibility and solver failure have distinct errors. Optional metadata fields
+are normalized across all records before dataset conversion, so later source IDs
+are retained even when the first record has none.
 Use at least five independent source groups per class for five partitions; more
 may be required for the requested fractions or connected groups.
 

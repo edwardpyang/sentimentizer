@@ -374,6 +374,7 @@ def router_train(
         assert_disjoint,
         load_router_dataset,
         load_router_records,
+        records_to_dataset,
     )
     from sentimentizer.router.train_router import train_router
 
@@ -384,11 +385,9 @@ def router_train(
         output_dir=Path(output_dir) if output_dir else train_cfg.output_dir,
     )
     if validation_data:
-        from datasets import Dataset
-
         train_rows, eval_rows = load_router_records(data), load_router_records(validation_data)
         assert_disjoint(train_rows, eval_rows)
-        train_ds, eval_ds = Dataset.from_list(train_rows), Dataset.from_list(eval_rows)
+        train_ds, eval_ds = records_to_dataset(train_rows), records_to_dataset(eval_rows)
     else:
         train_ds, eval_ds = load_router_dataset(data, seed=config.seed)
     train_router(config, train_ds, eval_ds)

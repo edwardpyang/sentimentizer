@@ -167,3 +167,91 @@ def test_source_identifiers_retain_case_while_text_duplicates_are_normalized():
         [{"text": "first", "label": 0, "group_id": "A"}],
         [{"text": "second", "label": 1, "group_id": "a"}],
     )
+
+
+def test_optional_metadata_survives_dataset_conversion_in_any_row_order():
+    from sentimentizer.router.dataset import dataset_fingerprint, records_to_dataset
+    from sentimentizer.router.provenance import add_dataset, dataset_records
+    from sentimentizer.router.schemas import RouterProvenance
+
+    rows = [
+        {"text": "standalone", "label": 0},
+        {
+            "text": "source A snippet",
+            "label": 1,
+            "group_id": "review-A",
+            "annotation": {"source": "human"},
+        },
+    ]
+    for ordered in (rows, list(reversed(rows))):
+        restored = dataset_records(records_to_dataset(ordered))
+        by_text = {row["text"]: row for row in restored}
+        assert by_text["standalone"]["group_id"] is None
+        assert by_text["source A snippet"]["group_id"] == "review-A"
+        assert by_text["source A snippet"]["annotation"] == {"source": "human"}
+        assert dataset_fingerprint(restored) == dataset_fingerprint(ordered)
+        provenance = RouterProvenance()
+        add_dataset(provenance, "train", restored)
+        from sentimentizer.router.dataset import assert_disjoint_keys, record_keys
+
+        with pytest.raises(ValueError, match="overlap"):
+            assert_disjoint_keys(
+                provenance.used_keys,
+                record_keys(
+                    [{"text": "another source A snippet", "label": 1, "group_id": "review-A"}]
+                ),
+            )
+
+
+def test_internal_split_retains_optional_metadata_for_every_record(tmp_path):
+    from sentimentizer.router.dataset import load_router_dataset
+
+    rows = [
+        {
+            "text": f"original {index}",
+            "label": index % 2,
+            **({"group_id": f"source-{index}"} if index % 3 else {}),
+        }
+        for index in range(30)
+    ]
+    data = tmp_path / "mixed.jsonl"
+    data.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    expected = {row["text"]: row.get("group_id") for row in rows}
+    for partition in load_router_dataset(str(data)):
+        assert "group_id" in partition.column_names
+        for row in partition:
+            assert row["group_id"] == expected[row["text"]]
+
+
+@pytest.mark.parametrize("mixed_groups", [False, True])
+def test_imbalanced_split_finds_rare_classes_in_both_partitions(mixed_groups):
+    rows = [
+        {"text": f"majority {index}", "label": 0, "group_id": f"majority-{index}"}
+        for index in range(1000)
+    ]
+    for label in range(1, 6):
+        for index in range(2):
+            group = f"minority-{label}-{index}"
+            rows.append({"text": group, "label": label, "group_id": group})
+            if mixed_groups:
+                rows.append(
+                    {"text": f"majority snippet from {group}", "label": 0, "group_id": group}
+                )
+    train, test = split_router_records(rows, test_size=0.2, seed=42)
+    assert {row["label"] for row in train} == set(range(6))
+    assert {row["label"] for row in test} == set(range(6))
+    assert len(test) == round(len(rows) * 0.2)
+    assert len(train) + len(test) == len(rows)
+    assert_disjoint(train, test)
+    assert (train, test) == split_router_records(rows, test_size=0.2, seed=42)
+
+
+def test_infeasible_mixed_group_constraints_still_fail():
+    # An odd cycle cannot put each pair of supporting groups on opposite sides.
+    rows = [
+        {"text": f"group {group} label {label}", "group_id": str(group), "label": label}
+        for group, labels in enumerate(((0, 1), (1, 2), (2, 0)))
+        for label in labels
+    ]
+    with pytest.raises(ValueError, match="infeasible"):
+        split_router_records(rows, test_size=0.5)

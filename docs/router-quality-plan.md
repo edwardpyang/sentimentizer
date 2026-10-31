@@ -6,7 +6,7 @@ _Original status: 📋 Not started — 2026-10-31_
 
 _Previous status: ⏳ Partially implemented — 2026-10-31_
 
-All three milestones are implemented. Final `make ci`: 762 passed, 1 skipped,
+All three milestones are implemented. Final `make ci`: 768 passed, 1 skipped,
 zero pyright errors, successful formatting/lint and wheel/sdist builds.
 The six deterministic concurrency cases passed alone; HTTP and compatibility
 tests passed. An additional offline smoke run exercised the actual benchmark,
@@ -14,6 +14,15 @@ calibrate, and evaluate CLI commands with a tiny trainable sentence encoder and
 real sklearn heads, writing and reloading artifacts. It verifies workflow wiring,
 not production model quality. No production backbone or human-labeled benchmark
 was downloaded or evaluated. GitHub main was rechecked at d5396bd before publication.
+
+Independent review follow-up fixed two data-pipeline gaps: conversion now retains
+the union of optional record fields, and a sparse constrained fallback finds
+class-complete grouped splits when random candidates miss rare classes. The
+reviewer independently confirmed preserved source-overlap detection and the
+six-class 808/202 split, with no new actionable findings. Regressions also cover
+mixed-label groups, genuinely infeasible constraints, both training conversion
+paths, and source IDs surviving artifact publication/reload. SciPy was already a
+scikit-learn requirement and is now declared directly for the fallback solver.
 
 Milestone 1 is implemented. Focused tests: 68 passed. `make ci`: 728 passed,
 2 skipped; lint/type checks and wheel/sdist builds passed. Local tests use the

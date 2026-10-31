@@ -303,3 +303,51 @@ def test_calibration_supports_native_string_classes():
         "negative",
         "positive",
     ]
+
+
+def test_training_cli_persists_optional_group_ids_and_rejects_later_overlap(tmp_path, monkeypatch):
+    import sentimentizer.router.train_router as module
+    from sentimentizer.router.dataset import record_keys, save_dataset_to_jsonl
+    from workflows.cli import cli
+
+    train_rows = [
+        {"text": "-1 standalone", "label": 0},
+        {"text": "2 source A snippet", "label": 1, "group_id": "review-A"},
+        {"text": "-3 source B snippet", "label": 0, "group_id": "review-B"},
+        {"text": "4 source C snippet", "label": 1, "group_id": "review-C"},
+    ]
+    train = save_dataset_to_jsonl(train_rows, str(tmp_path / "train.jsonl"))
+    validation = save_dataset_to_jsonl(records("validation"), str(tmp_path / "validation.jsonl"))
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "training:\n  training_mode: frozen\n  task:\n"
+        "    task_id: test\n    labels: [negative, positive]\n"
+    )
+    output = tmp_path / "model"
+    monkeypatch.setattr(module, "SentenceTransformer", lambda _: TinyBackbone())
+    result = CliRunner().invoke(
+        cli,
+        [
+            "router",
+            "train",
+            "--data",
+            str(train),
+            "--validation-data",
+            str(validation),
+            "--config",
+            str(config),
+            "--output-dir",
+            str(output),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    metadata = RouterModel.read_metadata(output)
+    assert set(record_keys(train_rows)["groups"]) <= set(metadata.provenance.used_keys["groups"])
+    monkeypatch.setattr(
+        "sentimentizer.router.model._get_sentence_transformers", lambda: lambda _: TinyBackbone()
+    )
+    restored = RouterModel.from_pretrained(output)
+    with pytest.raises(ValueError, match="overlap"):
+        evaluate_router(
+            restored, [{"text": "6 another source A snippet", "label": 1, "group_id": "review-A"}]
+        )
