@@ -780,8 +780,14 @@ def run(
     """
     from workflows.stages.extract import run_extract
     from workflows.stages.tokenize import run_tokenize
-    from workflows.stages.train import run_train
+    from workflows.stages.train import run_train, validate_train_options
 
+    validate_train_options(
+        ctx.obj,
+        distributed=train_kwargs["distributed"],
+        resume=resume_train,
+        checkpoint_dir=train_kwargs["checkpoint_dir"],
+    )
     run_extract(ctx.obj, stop=stop)
     run_tokenize(ctx.obj, resume=resume_tokenize)
     run_train(ctx.obj, resume=resume_train, **train_kwargs)

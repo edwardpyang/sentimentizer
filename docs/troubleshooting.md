@@ -139,7 +139,7 @@ With per-batch scheduler stepping, `total_steps` is computed as `epochs * steps_
 
 **Cause**: `n_heads` cannot be inferred from weight shapes — `nn.MultiheadAttention` stores `in_proj_weight` as `(3 * d_model, d_model)` regardless of head count. Reconstructing the model from weight-shape inference alone silently rebuilds it with the **default** architecture, which then fails to load tuned weights.
 
-**Fix**: `_train_final_model` writes a sidecar config JSON next to the weights (`best_model_<type>_config.json` beside `best_model_<type>.pth`). `_load_trained_model` reads it to reconstruct the exact architecture. If the sidecar is missing (Hugging Face downloads, older checkpoints — all of which use the default architecture), it logs `model_config_sidecar_missing` and falls back to weight-shape inference. If you hit this with a custom checkpoint, ensure the sidecar JSON is present alongside the `.pth`.
+**Fix**: `_train_final_model` writes a sidecar config JSON next to the weights (`best_model_<type>_config.json` beside `best_model_<type>.pth`). `_load_trained_model` reads it to reconstruct the exact architecture. If the sidecar is missing (Hugging Face downloads, older checkpoints — all of which use the default architecture), it logs `model_config_sidecar_missing` and falls back to weight-shape inference. If you hit this with a custom checkpoint, ensure the sidecar JSON is present alongside the `.pth`. Weights published to the serving path embed the same config as `model_config`, because the sidecar does not travel with them to serving or the Hub.
 
 ## Data Pipeline Issues
 

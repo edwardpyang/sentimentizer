@@ -94,10 +94,10 @@ train-no-checkpoint:
 
 ## Resume training from the latest checkpoint
 train-resume:
-	$(INHIBIT_SLEEP) uv run sentimentizer --model $(MODEL) --device $(DEVICE) --run-type $(RUN_TYPE) run --stop $(STOP) \
-		--checkpoint-dir $(CHECKPOINT_DIR) --resume-train --save
+	$(INHIBIT_SLEEP) uv run sentimentizer --model $(MODEL) --device $(DEVICE) --run-type $(RUN_TYPE) train \
+		--checkpoint-dir $(CHECKPOINT_DIR) --resume --save
 
-## Distributed training with Ray Train (2 workers by default)
+## Distributed training with Ray Train (1 worker; use train-dist-workers for more)
 train-distributed:
 	$(INHIBIT_SLEEP) uv run sentimentizer --model $(MODEL) --device $(DEVICE) --run-type $(RUN_TYPE) run --stop $(STOP) \
 		--distributed --checkpoint-dir $(CHECKPOINT_DIR) --checkpoint-every 1 --save

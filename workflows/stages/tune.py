@@ -110,5 +110,5 @@ def run_tune(
     else:
         logger.warning(
             "tuning_run_failed: model predictions did not meet validation threshold "
-            f"({result.validation_threshold}) after {result.retry_count} retries"
+            f"({config.validation_threshold}) after {result.retry_count} retries"
         )

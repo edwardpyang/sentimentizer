@@ -192,11 +192,14 @@ interrupted machine does not lose the run. `TrainerConfig.checkpoint_dir`
 defaults to `""` (disabled) — checkpointing is enabled by CLI/Makefile, not by
 the config dataclass.
 
-- Resume: `make train-resume MODEL=modernbert` (uses `--resume-train` →
-  `latest_checkpoint()` → restores model/optimizer/scheduler state)
+- Resume: `make train-resume MODEL=modernbert` (uses `train --resume` →
+  `latest_checkpoint()` → restores model/optimizer/scheduler state). Requires
+  `--checkpoint-dir`; rejected with `--distributed`.
 - Disable: `make train-no-checkpoint`
 - Contents: model weights, optimizer state, scheduler state, epoch, val_loss
-- `best_model.pth` written whenever val_loss improves (`--checkpoint-best`, default True)
+- `best_model.pth` written whenever val_loss improves; `--save` persists these best
+  weights, not the final epoch's
+- ModernBERT keeps a `backbone/` per checkpoint in `<checkpoint_stem>/`
 
 ### Sleep prevention
 
@@ -254,7 +257,8 @@ required after any dashboard change.
   (`{"negative": …, "neutral": …, "positive": …}`) with no `token_count` or
   `model` field. Used by `diagnose_model.py` and `hf.py`.
 - **Tuned models save a sidecar config JSON** (`best_model_<type>_config.json`)
-  — `n_heads` cannot be inferred from weights, so reconstruction needs it.
+  — `n_heads` cannot be inferred from weights, so reconstruction needs it. Weights
+  copied to the serving path embed it as `model_config` (`unpack_saved_weights()`).
 - All function signatures need type hints.
 
 ### Serving API

@@ -317,7 +317,7 @@ On the Grafana dashboard:
 During training, `torch.softmax()` on extreme logit values can produce NaN, which would cause metric computation errors. The codebase handles this at multiple levels:
 
 1. **`sentimentizer/metrics.py`**: `compute_classification_metrics()` replaces NaN probabilities with `1/num_classes` (i.e., 1/3 ≈ 0.333 for 3-class) via `_replace_nan_probs()` before passing to `torchmetrics.MulticlassAUROC`. Rows with partial NaN are re-normalized to sum to 1.0. Cohen's kappa from `torchmetrics.MulticlassCohenKappa` returns NaN for single-class targets — `_safe_item()` coerces this to 0.0 to avoid Prometheus gauge issues.
-2. **`sentimentizer/metrics.py`**: `compute_metrics_from_model()` replaces NaN at the tensor level using `torch.where()` before converting to numpy
+2. **`sentimentizer/metrics.py`**: `_replace_nan_probs()` replaces NaN at the tensor level using `torch.where()` before AUC computation
 3. **`sentimentizer/trainer.py`**: Both `Trainer.evaluate()` and `_train_func()` (Ray) replace NaN in probabilities with `1/num_classes` after `torch.softmax()`
 
 ## Starting the Metrics Stack

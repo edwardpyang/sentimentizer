@@ -18,7 +18,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 try:
     import ray
     from ray import train
-    from ray.train import Checkpoint, ScalingConfig
+    from ray.train import Checkpoint, CheckpointConfig, RunConfig, ScalingConfig
     from ray.train.torch import TorchTrainer, prepare_model
 except ImportError:
     pass
@@ -243,6 +243,8 @@ def _get_ray_gauges(model_type: str, run_id: str = "") -> dict[str, Any] | None:
 
 
 logger = new_logger(DEFAULT_LOG_LEVEL)
+
+BEST_CHECKPOINT_NAME = "best_model.pth"
 
 
 # ──────────────────────────────────────────────
@@ -955,6 +957,24 @@ class Trainer:
     latest_epoch: int = 0
     latest_metrics: ClassificationMetrics | None = None
 
+    def rebuild_scheduler(self, steps_per_epoch: int, epochs: int) -> None:
+        """Replace the placeholder scheduler with one sized for the real training length."""
+        sched_params = _get_sched_params(self.model_type)
+        grad_accum = max(1, self.cfg.gradient_accumulation_steps)
+        total_steps = epochs * max(1, steps_per_epoch // grad_accum)
+        warmup_ratio = getattr(sched_params, "warmup_ratio", 0.06)
+        warmup_steps = max(1, round(warmup_ratio * total_steps))
+        self.scheduler = _LinearWarmupCosineScheduler(
+            self.optimizer,
+            warmup_steps=warmup_steps,
+            total_steps=total_steps,
+            eta_min=sched_params.eta_min,
+        )
+        logger.info(
+            f"[{self.model_type}] per-step scheduler: "
+            f"total_steps={total_steps}, warmup_steps={warmup_steps}"
+        )
+
     def _train_epoch(self, model: torch.nn.Module, train_loader: DataLoader, epoch: int) -> None:
         model.train()
         epoch_loss_sum = 0.0
@@ -1098,27 +1118,12 @@ class Trainer:
             else:
                 scheduler_needs_rebuild = False
         if scheduler_needs_rebuild:
-            sched_params = _get_sched_params(self.model_type)
-            steps_per_epoch = len(train_loader)
-            grad_accum = max(1, self.cfg.gradient_accumulation_steps)
-            total_steps = epochs * max(1, steps_per_epoch // grad_accum)
-            warmup_ratio = getattr(sched_params, "warmup_ratio", 0.06)
-            warmup_steps = max(1, round(warmup_ratio * total_steps))
-            self.scheduler = _LinearWarmupCosineScheduler(
-                self.optimizer,
-                warmup_steps=warmup_steps,
-                total_steps=total_steps,
-                eta_min=sched_params.eta_min,
-            )
+            self.rebuild_scheduler(len(train_loader), epochs)
             # Fast-forward past already-completed epochs so the LR is
             # approximately where it would have been at this point.
             if completed_steps > 0:
                 for _ in range(completed_steps):
                     self.scheduler.step()
-            logger.info(
-                f"[{self.model_type}] per-step scheduler: "
-                f"total_steps={total_steps}, warmup_steps={warmup_steps}"
-            )
 
         if is_resuming:
             # For per-epoch schedulers (RNN/Encoder/Decoder), fast-forward
@@ -1205,7 +1210,7 @@ class Trainer:
 
                 # Save best model checkpoint
                 if checkpoint_dir and checkpoint_best and improved:
-                    best_path = Path(checkpoint_dir) / "best_model.pth"
+                    best_path = Path(checkpoint_dir) / BEST_CHECKPOINT_NAME
                     save_checkpoint(
                         model,
                         self.optimizer,
@@ -1585,13 +1590,18 @@ class _LinearWarmupCosineScheduler(torch.optim.lr_scheduler.LambdaLR):
         # effective LR bottoms out at base_lr * eta_min (e.g. 1e-4 * 1e-6 = 1e-10).
         base_lrs = [g["lr"] for g in optimizer.param_groups]
 
+        # The lambdas read the plan from self rather than capturing it:
+        # load_state_dict() restores these attributes but cannot restore closures,
+        # so captured values would keep a placeholder scheduler's step counts on resume.
         def make_lambda(base_lr: float) -> Callable[[int], float]:
-            relative_eta_min = eta_min / base_lr if base_lr > 0 else 0.0
-
             def lr_lambda(step: int) -> float:
-                if step < warmup_steps:
-                    return (step + 1) / max(1, warmup_steps)
-                progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+                if step < self.warmup_steps:
+                    return (step + 1) / max(1, self.warmup_steps)
+                relative_eta_min = self.eta_min / base_lr if base_lr > 0 else 0.0
+                progress = min(
+                    1.0,
+                    (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps),
+                )
                 return relative_eta_min + (1.0 - relative_eta_min) * 0.5 * (
                     1.0 + math.cos(math.pi * progress)
                 )
@@ -1605,6 +1615,8 @@ def new_trainer(
     model: torch.nn.Module,
     cfg: TrainerConfig,
     model_type: str,
+    lr: float | None = None,
+    weight_decay: float | None = None,
 ) -> Trainer:
     # Build class_weights tensor from config if provided
     class_weights_tensor = None
@@ -1616,6 +1628,8 @@ def new_trainer(
         model_type=model_type,
         device=cfg.device,
         cfg=cfg,
+        lr=lr,
+        weight_decay=weight_decay,
         class_weights=class_weights_tensor,
     )
 
@@ -1633,6 +1647,64 @@ def new_trainer(
 # ──────────────────────────────────────────────
 # Ray Train distributed training
 # ──────────────────────────────────────────────
+
+
+def _gather_validation(
+    loss_sum: float, sample_count: int, probabilities: np.ndarray, targets: np.ndarray
+) -> tuple[float, int, np.ndarray, np.ndarray]:
+    """Combine validation results across workers, so every rank sees the same numbers.
+
+    Each worker validates only its own shard. Without this, rank 0 would report metrics
+    for part of the data, and workers could disagree about early stopping and leave DDP
+    waiting on a rank that already stopped.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return loss_sum, sample_count, probabilities, targets
+    gathered: list[Any] = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, (loss_sum, sample_count, probabilities, targets))
+    return (
+        sum(part[0] for part in gathered),
+        sum(part[1] for part in gathered),
+        np.concatenate([part[2] for part in gathered]),
+        np.concatenate([part[3] for part in gathered]),
+    )
+
+
+def _report_metrics(
+    train_loss: float, val_loss: float, metrics: ClassificationMetrics, epoch: int, lr: float
+) -> dict[str, Any]:
+    """Build the per-epoch metrics dict reported to Ray Train.
+
+    The driver persists the final report for the exporter, so anything missing here
+    would overwrite that gauge's real value with zero when the run ends.
+    """
+    return {
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+        "accuracy": metrics.accuracy,
+        "balanced_accuracy": metrics.balanced_accuracy,
+        "negative_precision": metrics.negative_precision,
+        "negative_recall": metrics.negative_recall,
+        "negative_f1": metrics.negative_f1,
+        "neutral_precision": metrics.neutral_precision,
+        "neutral_recall": metrics.neutral_recall,
+        "neutral_f1": metrics.neutral_f1,
+        "positive_precision": metrics.positive_precision,
+        "positive_recall": metrics.positive_recall,
+        "positive_f1": metrics.positive_f1,
+        "macro_f1": metrics.macro_f1,
+        "weighted_f1": metrics.weighted_f1,
+        "cohen_kappa": metrics.cohen_kappa,
+        "mcc": metrics.mcc,
+        "neutral_to_positive_rate": metrics.neutral_to_positive_rate,
+        "neutral_to_negative_rate": metrics.neutral_to_negative_rate,
+        "pred_neutral_frac": metrics.pred_neutral_frac,
+        "neutral_auc_roc": metrics.neutral_auc_roc,
+        "neutral_avg_precision": metrics.neutral_avg_precision,
+        "total": metrics.total,
+        "epoch": epoch,
+        "lr": lr,
+    }
 
 
 def _train_func(config: dict) -> None:
@@ -1803,6 +1875,7 @@ def _train_func(config: dict) -> None:
     # For per-batch-stepping models, rebuild scheduler with real optimizer-step
     # counts before training starts. Uses the same dataset-count estimate that
     # drives the tqdm total_batches calculation below.
+    # DDP does not forward custom methods such as prepare_batch to the wrapped model.
     inner_model = model.module if hasattr(model, "module") else model
     if getattr(type(inner_model), "STEP_SCHEDULER_PER_BATCH", False) and scheduler is not None:
         _train_dataset_count = config.get("train_dataset_count", 0)
@@ -1908,7 +1981,7 @@ def _train_func(config: dict) -> None:
 
         with ctx:
             for i, batch in enumerate(train_pbar):
-                inputs, target = model.prepare_batch(batch, device)
+                inputs, target = inner_model.prepare_batch(batch, device)
                 bs = target.size(0)
                 loss_val, step_grad_norm = train_step(
                     model,
@@ -2022,7 +2095,7 @@ def _train_func(config: dict) -> None:
             for batch in val_shard.iter_torch_batches(
                 batch_size=batch_size, collate_fn=_ray_collate_fn
             ):
-                inputs, target = model.prepare_batch(batch, device)
+                inputs, target = inner_model.prepare_batch(batch, device)
                 bs = target.size(0)
                 logits = model(**inputs) if isinstance(inputs, dict) else model(inputs)
                 loss_val = loss_function(logits, target)
@@ -2032,11 +2105,15 @@ def _train_func(config: dict) -> None:
                 all_probs.append(torch.softmax(logits, dim=-1).cpu())
                 all_targets.append(target.cpu())
 
-        val_loss = val_loss_sum / val_sample_count if val_sample_count > 0 else 0.0
         train_loss = epoch_loss_sum / epoch_sample_count if epoch_sample_count > 0 else 0.0
 
-        probabilities = torch.cat(all_probs).numpy()
-        targets = torch.cat(all_targets).numpy()
+        val_loss_sum, val_sample_count, probabilities, targets = _gather_validation(
+            val_loss_sum,
+            val_sample_count,
+            torch.cat(all_probs).numpy(),
+            torch.cat(all_targets).numpy(),
+        )
+        val_loss = val_loss_sum / val_sample_count if val_sample_count > 0 else 0.0
 
         # Free GPU memory held by validation intermediates before next training epoch
         del all_probs, all_targets
@@ -2101,30 +2178,20 @@ def _train_func(config: dict) -> None:
                 pickle.dump(checkpoint_data, fp)
             checkpoint = Checkpoint.from_directory(checkpoint_dir)
             train.report(
-                {
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "accuracy": metrics.accuracy,
-                    "balanced_accuracy": metrics.balanced_accuracy,
-                    "negative_precision": metrics.negative_precision,
-                    "negative_recall": metrics.negative_recall,
-                    "negative_f1": metrics.negative_f1,
-                    "neutral_precision": metrics.neutral_precision,
-                    "neutral_recall": metrics.neutral_recall,
-                    "neutral_f1": metrics.neutral_f1,
-                    "positive_precision": metrics.positive_precision,
-                    "positive_recall": metrics.positive_recall,
-                    "positive_f1": metrics.positive_f1,
-                    "macro_f1": metrics.macro_f1,
-                    "weighted_f1": metrics.weighted_f1,
-                    "cohen_kappa": metrics.cohen_kappa,
-                    "mcc": metrics.mcc,
-                    "total": metrics.total,
-                    "epoch": epoch,
-                    "lr": optimizer.param_groups[0]["lr"],
-                },
+                _report_metrics(
+                    train_loss, val_loss, metrics, epoch, optimizer.param_groups[0]["lr"]
+                ),
                 checkpoint=checkpoint,
             )
+
+        # Safe to stop here: every rank computed the same val_loss in _gather_validation.
+        early_stopping_patience = config.get("early_stopping_patience", 0)
+        if 0 < early_stopping_patience <= ray_patience_counter:
+            logger.info(
+                f"[{model_type}] early stopping at epoch {epoch}, "
+                f"val_loss hasn't improved for {ray_patience_counter} epochs"
+            )
+            break
 
     logger.info(f"[{model_type}] model fitting completed, {time.time() - start:.0f} seconds passed")
 
@@ -2132,6 +2199,15 @@ def _train_func(config: dict) -> None:
 # ──────────────────────────────────────────────
 # Checkpoint save / load
 # ──────────────────────────────────────────────
+
+
+def _checkpoint_artifact_dir(path: str | Path) -> Path:
+    """Return the directory holding on-disk artifacts for one checkpoint file.
+
+    Each checkpoint needs its own directory: models that keep weights outside the
+    metadata file (HF backbones) would otherwise overwrite every earlier checkpoint.
+    """
+    return Path(path).with_suffix("")
 
 
 def save_checkpoint(
@@ -2159,9 +2235,8 @@ def save_checkpoint(
         tokenizer: Optional tokenizer to include for transformer models.
     """
     inner = model.module if hasattr(model, "module") else model
-    ckpt_dir = Path(path).parent
     if hasattr(inner, "save_to_checkpoint_dir"):
-        metadata = inner.save_to_checkpoint_dir(ckpt_dir, tokenizer=tokenizer)
+        metadata = inner.save_to_checkpoint_dir(_checkpoint_artifact_dir(path), tokenizer=tokenizer)
     else:
         metadata = {"model_state_dict": inner.state_dict()}
     metadata.update(
@@ -2180,7 +2255,11 @@ def save_checkpoint(
         metadata["patience_counter"] = patience_counter
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(metadata, path)
+    # Replace atomically and last, so a checkpoint file that exists is always complete
+    # and its artifacts are already on disk.
+    tmp_path = Path(f"{path}.tmp")
+    torch.save(metadata, tmp_path)
+    os.replace(tmp_path, path)
     logger.info(f"checkpoint saved: {path} (epoch={epoch})")
 
     if getattr(type(inner), "NEEDS_TOKENIZE_STAGE", True) is False and tokenizer is None:
@@ -2234,11 +2313,16 @@ def load_checkpoint(
     metadata = torch.load(path, map_location=device, weights_only=True)
 
     inner = model.module if hasattr(model, "module") else model
-    if hasattr(type(inner), "load_from_checkpoint_dir"):
-        loaded_model = type(inner).load_from_checkpoint_dir(Path(path).parent, metadata, device)
-        inner.load_state_dict(loaded_model.state_dict())
-    else:
+    if "model_state_dict" in metadata:
+        # The caller's model already has the right architecture, which may be tuned;
+        # rebuilding one from config defaults could not hold these weights.
         inner.load_state_dict(metadata["model_state_dict"])
+    else:
+        artifact_dir = _checkpoint_artifact_dir(path)
+        # Checkpoints from before per-checkpoint directories share the parent directory.
+        ckpt_dir = artifact_dir if artifact_dir.is_dir() else Path(path).parent
+        loaded_model = type(inner).load_from_checkpoint_dir(ckpt_dir, metadata, device)
+        inner.load_state_dict(loaded_model.state_dict())
 
     if optimizer is not None and "optimizer_state_dict" in metadata:
         try:
@@ -2275,7 +2359,10 @@ def list_checkpoints(checkpoint_dir: str | Path) -> list[Path]:
     ckpt_dir = Path(checkpoint_dir)
     if not ckpt_dir.exists():
         return []
-    return sorted(ckpt_dir.glob("checkpoint_epoch_*.pth"))
+    return sorted(
+        ckpt_dir.glob("checkpoint_epoch_*.pth"),
+        key=lambda ckpt: int(ckpt.stem.rsplit("_", 1)[-1]),
+    )
 
 
 def latest_checkpoint(checkpoint_dir: str | Path) -> Path | None:
@@ -2286,6 +2373,24 @@ def latest_checkpoint(checkpoint_dir: str | Path) -> Path | None:
     """
     checkpoints = list_checkpoints(checkpoint_dir)
     return checkpoints[-1] if checkpoints else None
+
+
+def restore_best_checkpoint(
+    model: torch.nn.Module, checkpoint_dir: str | Path | None, device: str = "cpu"
+) -> bool:
+    """Load the lowest-val-loss weights into *model* so callers save those, not the last epoch.
+
+    Returns:
+        True if best weights were restored. False if none exist (checkpointing disabled),
+        in which case *model* keeps its final-epoch weights.
+    """
+    best_path = Path(checkpoint_dir) / BEST_CHECKPOINT_NAME if checkpoint_dir else None
+    if best_path is None or not best_path.exists():
+        logger.warning("no best checkpoint found, keeping final-epoch weights")
+        return False
+    load_checkpoint(best_path, model, device=device)
+    logger.info(f"restored best weights from {best_path}")
+    return True
 
 
 # ──────────────────────────────────────────────
@@ -2351,6 +2456,7 @@ def new_ray_trainer(
         "train_dataset_count": train_ds.count(),
         "num_workers": cfg.ray_workers,
         "ray_update_every": cfg.ray_update_every,
+        "early_stopping_patience": cfg.early_stopping_patience,
     }
 
     use_gpu = cfg.device in ("cuda", "mps")
@@ -2361,6 +2467,16 @@ def new_ray_trainer(
         scaling_config=ScalingConfig(
             num_workers=cfg.ray_workers,
             use_gpu=use_gpu,
+        ),
+        # Keep only the best checkpoint by val_loss; Ray also always keeps the latest.
+        run_config=RunConfig(
+            storage_path=str(Path(cfg.checkpoint_dir).resolve()) if cfg.checkpoint_dir else None,
+            name=cfg.run_id,
+            checkpoint_config=CheckpointConfig(
+                num_to_keep=1,
+                checkpoint_score_attribute="val_loss",
+                checkpoint_score_order="min",
+            ),
         ),
         datasets={"train": train_ds, "val": val_ds},
     )

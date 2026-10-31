@@ -538,6 +538,8 @@ class TestMetricsGauges:
         mock_model.return_value = torch.randn(2, 3)
         mock_model.state_dict.return_value = {}
         mock_model.prepare_batch.return_value = (torch.randn(2, 2), torch.tensor([1, 1]))
+        # MagicMock invents attributes; without this, unwrapping DDP finds an unrelated mock.
+        mock_model.module = mock_model
 
         # 4. Mock dependencies to isolate _train_func
         with (
