@@ -18,12 +18,6 @@ uv add sentimentizer
 
 # Install with distributed training, tuning, and serving features
 uv add "sentimentizer[ray]"
-
-# Install the headless ComfyUI image API client
-uv add "sentimentizer[diffusion]"
-
-# Install all features
-uv add "sentimentizer[ray,diffusion]"
 ```
 
 ---
@@ -122,143 +116,6 @@ See [reuse with external configurations](docs/router.md#reuse-with-external-conf
 
 ---
 
-## Image Generation (Krea 2 / Ideogram 4)
-
-Image generation uses a separately managed, headless ComfyUI process. Torch
-Sentiment submits native Krea 2 and Ideogram 4 workflows over HTTP; it does not
-load image weights or reserve the CUDA device inside Ray. The supported
-checkpoints are the official INT8 ConvRot builds.
-
-### Prerequisites
-
-```bash
-# Torch Sentiment side
-uv sync --extra ray --extra diffusion
-
-# Separate ComfyUI checkout and environment. This revision has native ConvRot,
-# Krea 2, and Ideogram 4 nodes; no custom nodes or browser UI are required.
-git clone https://github.com/Comfy-Org/ComfyUI.git ../ComfyUI
-cd ../ComfyUI
-git checkout feca51a
-uv venv
-uv pip install -r requirements.txt
-
-# Start API-only on localhost. Install the CUDA PyTorch build appropriate for
-# the host before this step if requirements did not select it.
-uv run python main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch \
-  --temp-directory /tmp/sentimentizer-comfyui
-```
-
-### Configure
-
-Put these files under the ComfyUI checkout:
-
-| Model | ComfyUI directory | Checkpoint |
-| :--- | :--- | :--- |
-| Krea 2 | `models/diffusion_models` | `krea2_turbo_int8_convrot.safetensors` |
-| Krea 2 | `models/text_encoders` | `qwen3vl_4b_fp8_scaled.safetensors` |
-| Krea 2 | `models/vae` | `qwen_image_vae.safetensors` |
-| Ideogram 4 | `models/diffusion_models` | `ideogram4_int8_convrot.safetensors` |
-| Ideogram 4 | `models/diffusion_models` | `ideogram4_unconditional_int8_convrot.safetensors` |
-| Ideogram 4 | `models/text_encoders` | `qwen3vl_8b_fp8_scaled.safetensors` |
-| Ideogram 4 | `models/vae` | `flux2-vae.safetensors` |
-
-The official download URLs are listed in
-[`docs/serving.md`](docs/serving.md#headless-comfyui-setup).
-
-Configuration lives in two YAML files:
-
-- **`sentimentizer/serve/service.yaml`** — enabled models, ComfyUI URL, auth, and rate limits.
-- **`sentimentizer/diffusion/diffusion_config.yaml`** — checkpoint filenames and generation defaults.
-
-Edit `service.yaml` to enable a model:
-
-```yaml
-# Enable one or both models
-krea_2_enabled: true
-# Required for Krea 2. Review the Community License and confirm eligibility.
-krea_2_license_accepted: true
-ideogram_4_enabled: true
-# Required for Ideogram 4. Review its non-commercial model license first.
-ideogram_4_license_accepted: true
-# Required for Krea 2. The endpoint must explicitly approve generated output.
-image_moderation_url: "http://127.0.0.1:8090/v1/moderate-image"
-image_moderation_api_key: "replace-me"
-default_image_model: "krea_2"
-comfyui_base_url: "http://127.0.0.1:8188"
-comfyui_temp_directory: "/tmp/sentimentizer-comfyui/temp"
-
-# Auth — required for image routes (/v1/images/*)
-api_keys: ["sk-your-secret-key"]
-
-```
-
-Or via environment variables:
-
-```bash
-export SENTIMENTIZER_KREA_2_ENABLED=true
-export SENTIMENTIZER_KREA_2_LICENSE_ACCEPTED=true
-export SENTIMENTIZER_IDEOGRAM_4_ENABLED=true
-export SENTIMENTIZER_IDEOGRAM_4_LICENSE_ACCEPTED=true
-export SENTIMENTIZER_IMAGE_MODERATION_URL=http://127.0.0.1:8090/v1/moderate-image
-export SENTIMENTIZER_COMFYUI_BASE_URL=http://127.0.0.1:8188
-export SENTIMENTIZER_COMFYUI_TEMP_DIRECTORY=/tmp/sentimentizer-comfyui/temp
-export SENTIMENTIZER_API_KEYS=sk-your-secret-key
-```
-
-Krea 2 uses the [Krea 2 Community License](https://www.krea.ai/krea-2-licensing).
-Its output-moderation endpoint receives JSON containing `image_b64`,
-`mime_type`, `model`, and `user`, and must return `{"safe": true}` to release
-the image. A rejection may return `{"safe": false, "code": "...", "message":
-"..."}`. Missing, malformed, or unavailable moderation responses fail closed.
-
-### Run
-
-```bash
-# Start Ray Serve; ComfyUI must already be running.
-python -m sentimentizer.serve
-
-# Krea 2 generation
-curl -X POST http://localhost:8000/v1/images/generate \
-  -H "Authorization: Bearer sk-your-secret-key" \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "a cinematic portrait of an astronaut", "model": "krea_2", "width": 1024, "height": 1024}'
-
-# Ideogram 4 generation; structured JSON prompts give its strongest text/layout results.
-curl -X POST http://localhost:8000/v1/images/generate \
-  -H "Authorization: Bearer sk-your-secret-key" \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "a bold poster reading FRESH", "model": "ideogram_4", "width": 1024, "height": 1024}'
-
-# List available models
-curl http://localhost:8000/v1/images/models \
-  -H "Authorization: Bearer sk-your-secret-key"
-
-# Async job mode (for long-running requests)
-curl -X POST http://localhost:8000/v1/images/jobs \
-  -H "Authorization: Bearer sk-your-secret-key" \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "a cinematic portrait of an astronaut", "model": "krea_2"}'
-
-# Poll job status
-curl http://localhost:8000/v1/images/jobs/{job_id} \
-  -H "Authorization: Bearer sk-your-secret-key"
-```
-
-### API Endpoints
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/v1/images/generate` | Required | Synchronous image generation |
-| POST | `/v1/images/jobs` | Required | Async job creation (201 + Location) |
-| GET | `/v1/images/jobs` | Required | List jobs (paginated, scoped to API key) |
-| GET | `/v1/images/jobs/{id}` | Required | Get job status |
-| DELETE | `/v1/images/jobs/{id}` | Required | Cancel the targeted ComfyUI prompt |
-| GET | `/v1/images/models` | Required | List available image models |
-| GET | `/v1/images/models/{name}` | Required | Single model metadata |
-
----
-
 ## Models
 
 Four architectures are available:
@@ -279,7 +136,6 @@ All models output **3-class logits** `(B, 3)` mapped to: negative (0), neutral (
 Detailed guides and implementation details are available in the specialized documentation files:
 
 - 🚀 **[Model Serving Guide](docs/serving.md)**: Ray Serve application deployment, FastAPI endpoints (sentiment/routing/image generation), and the Go CLI client.
-- 🎨 **[Headless Image Serving](docs/serving.md#image-generation-endpoints)**: Krea 2 and Ideogram 4 setup, checkpoints, API, and licensing.
 - 🏋️ **[Model Training & Checkpointing Guide](docs/training.md)**: Yelp datasets, single-node/distributed commands, training arguments, sleep prevention, and checkpoint resuming.
 - ⚙️ **[Model Configuration Reference](docs/configuration.md)**: Configuration dataclasses (`RNNConfig`, `EncoderConfig`, etc.), parameter defaults, and consistency checks.
 - 🎛️ **[Hyperparameter Tuning Guide](docs/tuning.md)**: Optuna searches, LangGraph iterative agent tuning (via Ollama GLM 5.1), and validation/retries.
@@ -307,11 +163,8 @@ uv sync --extra ray
 # Install dev and test suites
 uv sync --extra dev --extra ray
 
-# Install with diffusion (image generation) support
-uv sync --extra diffusion
-
 # Full development install
-uv sync --extra dev --extra ray --extra diffusion
+uv sync --extra dev --extra ray --extra router --extra onnx
 ```
 
 ### Local CUDA / GPU development
@@ -364,20 +217,12 @@ sentimentizer/
 ├── metrics.py            # 3-class classification metrics (per-class P/R/F1, balanced accuracy, MCC)
 ├── metrics_publisher.py   # Epoch metrics publishing (Prometheus + JSON) + intra-epoch batch snapshots
 ├── predictor.py           # SentimentPredictor (model loading, inference)
-├── safety.py              # Shared prompt safety (NSFW blocklist, injection patterns)
+├── safety.py              # Prompt-injection patterns for web search results
 ├── serve/                 # Ray Serve deployment: FastAPI + @serve.ingress, /v1/ prefix
 │   ├── app.py             # FastAPI route handlers and deployment class
 │   ├── base.py            # ServiceMetrics (request/latency tracking), _DummyServe fallback
 │   ├── config.py           # Serve deployment configuration (YAML/env var loading, incl. cors_origins)
-│   ├── middleware.py       # Auth, rate limiting, idempotency, prompt safety for image routes
-│   ├── models.py          # Pydantic request/response models for Swagger docs
-│   ├── diffusion_models.py # Pydantic request/response models for image generation (+ Job models)
-│   └── diffusion_app.py    # Headless ComfyUI deployment, dispatcher, and job endpoints
-├── diffusion/                # ComfyUI workflows and image job support
-│   ├── comfyui.py            # HTTP client + Krea 2 / Ideogram 4 native workflows
-│   ├── config.py             # ImageModelConfig + YAML/env loading
-│   ├── diffusion_config.yaml # ConvRot checkpoint names and sampling defaults
-│   └── job_store.py          # JobStoreLogic + Ray actor for async job metadata
+│   └── models.py          # Pydantic request/response models for Swagger docs
 ├── tokenizer.py           # Text tokenizer with pre-trained support
 ├── trainer.py             # Training logic
 ├── tuner.py               # Ray Tune + Optuna hyperparameter search

@@ -29,7 +29,7 @@ Ray Serve cold starts, and metrics pipeline debugging.
 - **Ray Train boundary (worker lifecycle).** Log worker start/end with rank,
   world size, and device. A hung driver must be distinguishable from a hung
   worker.
-- **External call boundary (Hugging Face, ComfyUI).** Before calling an
+- **External call boundary (Hugging Face).** Before calling an
   external service, log what's about to happen (model name, URL, endpoint).
   After, log the outcome (bytes downloaded, status, duration_s).
 - **Metrics pipeline boundary.** Log when metric files are written, reset, or

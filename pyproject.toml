@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sentimentizer"
-version = "0.330.4"
+version = "0.331.0"
 description = "smole language models"
 readme = "README.md"
 authors = [{ name = "Edward Yang", email = "edwardpyang@gmail.com" }]
@@ -51,9 +51,6 @@ ray = [
     "ray[train]>=2.55.1,<2.56.0",
     "ray[tune]>=2.55.1,<2.56.0",
     "optuna>=4.8.0",
-]
-diffusion = [
-    "pillow>=12.0.0",
 ]
 router = [
     "sentence-transformers>=4.0.0",

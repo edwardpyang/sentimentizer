@@ -442,6 +442,15 @@ same order; do not pad a short response with fabricated predictions.
 
 **Fix**: Check the raw response headers with `curl -v`. If duplicates appear, check the Ray Serve proxy configuration. In the current setup, this shouldn't happen because Ray's proxy doesn't add CORS headers by default.
 
+### Long-running Ray Serve dies when training starts
+
+Training's `_kill_stale_ray_processes` (`workflows/lifecycle.py`) runs `pkill` on
+every `raylet`, `gcs_server`, and `ray::IDLE` on the host when `ray.init` fails, and
+`_cleanup_stale_ray_sessions` deletes `/tmp/ray/session_*` directories older than an
+hour, which can include a live session. This affects any Ray service on the host,
+including sentiment Serve and imagenate. Run long-lived services in their own
+containers, or do not train on that host.
+
 ### Ray Train Worker Crashes
 
 **Symptoms**: Ray workers crash with `ModuleNotFoundError: No module named 'ray'` when starting distributed training.

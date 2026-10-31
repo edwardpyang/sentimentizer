@@ -344,13 +344,6 @@ class HealthLiveResponse(BaseModel):
     model_config = {"json_schema_extra": {"examples": [{"status": "live", "uptime_s": 123.4}]}}
 
 
-class ImageModelsStatus(BaseModel):
-    """Status of image models within health ready response."""
-
-    krea_2: Literal["enabled", "disabled"]
-    ideogram_4: Literal["enabled", "disabled"]
-
-
 class HealthReadyResponse(BaseModel):
     """Response from /health/ready."""
 
@@ -361,7 +354,6 @@ class HealthReadyResponse(BaseModel):
     model_loaded: str
     router_loaded: bool
     router_error: str | None = None
-    image_models: ImageModelsStatus | None = None
 
     model_config = {
         "json_schema_extra": {
@@ -374,10 +366,6 @@ class HealthReadyResponse(BaseModel):
                     "model_loaded": "encoder",
                     "router_loaded": True,
                     "router_error": None,
-                    "image_models": {
-                        "krea_2": "enabled",
-                        "ideogram_4": "disabled",
-                    },
                 }
             ]
         }

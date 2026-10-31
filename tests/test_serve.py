@@ -15,7 +15,7 @@ mock ``self`` that mirrors the deployment's runtime attributes.
 import asyncio
 import inspect
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
@@ -119,8 +119,6 @@ def _mock_deployment(predictor=None, ready=True, load_error=None):
     dep._sentiment_metrics = ServiceMetrics(prefix="sentimentizer")
     dep._router_metrics = ServiceMetrics(prefix="router")
     dep._embedding_metrics = ServiceMetrics(prefix="embedding")
-    dep._image_model_names = []
-    dep._comfyui_health_client = None
     dep.predictor = predictor or _mock_predictor()
     dep._require_ready = lambda: _SentimentizerDeployment._require_ready(dep)
 
@@ -300,34 +298,6 @@ class TestPydanticValidation:
         assert any("texts" in str(e.get("loc", [])) for e in errors)
 
 
-class TestGenerateRequestValidation:
-    def test_reference_images_empty_list_coerced_to_none(self) -> None:
-        from sentimentizer.serve.diffusion_models import GenerateRequest
-
-        req = GenerateRequest(prompt="test", reference_images=[])
-        assert req.reference_images is None
-
-    def test_reference_images_valid(self) -> None:
-        from sentimentizer.serve.diffusion_models import GenerateRequest
-
-        req = GenerateRequest(prompt="test", reference_images=["b64_1", "b64_2"])
-        assert req.reference_images == ["b64_1", "b64_2"]
-
-    def test_reference_images_too_many(self) -> None:
-        from sentimentizer.serve.diffusion_models import GenerateRequest
-
-        with pytest.raises(ValidationError) as exc_info:
-            GenerateRequest(prompt="test", reference_images=["b64_1", "b64_2", "b64_3"])
-        assert any(e["type"] == "value_error" for e in exc_info.value.errors())
-
-    def test_reference_images_empty_string(self) -> None:
-        from sentimentizer.serve.diffusion_models import GenerateRequest
-
-        with pytest.raises(ValidationError) as exc_info:
-            GenerateRequest(prompt="test", reference_images=[""])
-        assert any(e["type"] == "value_error" for e in exc_info.value.errors())
-
-
 # ---------------------------------------------------------------------------
 # Test: Prediction response schema (P1#5 additive format)
 # ---------------------------------------------------------------------------
@@ -382,17 +352,10 @@ class TestReadinessEndpoint:
         assert isinstance(result, JSONResponse)
         assert result.status_code == 503
 
-    def test_health_ready_returns_503_when_comfyui_is_unavailable(self):
-        dep = _mock_deployment()
-        dep._image_model_names = ["krea_2"]
-        dep._comfyui_health_client = MagicMock()
-        dep._comfyui_health_client.system_stats.side_effect = RuntimeError("connection refused")
-
-        result = _run(_SentimentizerDeployment.health_ready(dep))
-
-        assert isinstance(result, JSONResponse)
-        assert result.status_code == 503
-        assert b'"krea_2":"unavailable"' in result.body
+    def test_health_ready_has_no_image_keys(self):
+        result = _run(_SentimentizerDeployment.health_ready(_mock_deployment()))
+        assert "image_models" not in result
+        assert "image_backend_error" not in result
 
 
 class TestHealthBackwardCompat:
@@ -1066,66 +1029,101 @@ class TestCORSMiddleware:
 
 
 # ---------------------------------------------------------------------------
-# Test: Rate Limiter and Auth (H3 and M8)
+# Test: Image settings moved to the imagenate service
 # ---------------------------------------------------------------------------
 
 
-class TestRateLimiterAndAuth:
-    """Test API key authentication and rate limiting behavior."""
+class TestRemovedImageSettings:
+    def test_removed_env_var_warns_and_is_ignored(self, monkeypatch):
+        from sentimentizer.serve import config as config_module
 
-    def test_require_api_key_valid(self):
-        import os
+        monkeypatch.setenv("SENTIMENTIZER_KREA_2_ENABLED", "true")
+        with patch.object(config_module, "logger") as logger:
+            loaded = config_module.load_serve_config()
+        logger.warning.assert_called_once_with(
+            "image_setting_ignored_moved_to_imagenate", env_var="SENTIMENTIZER_KREA_2_ENABLED"
+        )
+        assert not hasattr(loaded, "krea_2_enabled")
 
-        # Force reloading valid keys
-        import sentimentizer.serve.middleware as middleware
-        from sentimentizer.serve.middleware import require_api_key
+    def test_per_model_diffusion_env_var_warns(self, monkeypatch):
+        from sentimentizer.serve import config as config_module
 
-        middleware._valid_keys_cache = None
+        monkeypatch.setenv("SENTIMENTIZER_DIFFUSION_KREA_2_DEFAULT_STEPS", "4")
+        with patch.object(config_module, "logger") as logger:
+            config_module.load_serve_config()
+        logger.warning.assert_called_once()
 
-        os.environ["SENTIMENTIZER_API_KEYS"] = "test-key-1,test-key-2"
-        try:
-            assert require_api_key("Bearer test-key-1") == "test-key-1"
-        finally:
-            del os.environ["SENTIMENTIZER_API_KEYS"]
-            middleware._valid_keys_cache = None
+    def test_stale_yaml_key_warns_instead_of_failing_startup(self, tmp_path):
+        from sentimentizer.serve import config as config_module
 
-    def test_require_api_key_invalid(self):
-        import os
+        path = tmp_path / "service.yaml"
+        path.write_text("api_keys: [secret-value]\nserve_port: 9000\n")
+        with patch.object(config_module, "logger") as logger:
+            loaded = config_module.load_serve_config(path)
+        assert loaded.serve_port == 9000
+        logger.warning.assert_called_once_with(
+            "image_setting_ignored_moved_to_imagenate", yaml_key="api_keys"
+        )
+        assert "secret-value" not in str(logger.warning.call_args)
 
-        import sentimentizer.serve.middleware as middleware
-        from sentimentizer.serve.middleware import require_api_key
+    def test_clean_config_does_not_warn(self):
+        from sentimentizer.serve import config as config_module
 
-        middleware._valid_keys_cache = None
+        with patch.object(config_module, "logger") as logger:
+            config_module.load_serve_config()
+        logger.warning.assert_not_called()
 
-        os.environ["SENTIMENTIZER_API_KEYS"] = "test-key-1"
-        try:
-            with pytest.raises(HTTPException) as exc_info:
-                require_api_key("Bearer wrong-key")
-            assert exc_info.value.status_code == 401
-            assert exc_info.value.detail["code"] == "invalid_api_key"
-        finally:
-            del os.environ["SENTIMENTIZER_API_KEYS"]
-            middleware._valid_keys_cache = None
 
-    def test_get_limiter_respects_config(self):
-        import os
+# ---------------------------------------------------------------------------
+# Test: Request body size limits
+# ---------------------------------------------------------------------------
 
-        import sentimentizer.serve.middleware as middleware
-        from sentimentizer.serve.middleware import _get_limiter
 
-        # Reset global limiter
-        middleware._limiter = None
+class TestRequestBodySizeLimitMiddleware:
+    def _make_app(self) -> FastAPI:
 
-        os.environ["SENTIMENTIZER_RATE_LIMIT_PER_MIN"] = "99"
-        os.environ["SENTIMENTIZER_RATE_LIMIT_BURST"] = "5"
-        try:
-            limiter = _get_limiter()
-            assert limiter._rpm == 99
-            assert limiter._burst == 5
-        finally:
-            del os.environ["SENTIMENTIZER_RATE_LIMIT_PER_MIN"]
-            del os.environ["SENTIMENTIZER_RATE_LIMIT_BURST"]
-            middleware._limiter = None
+        from sentimentizer.serve.app import _RequestBodySizeLimitMiddleware
+
+        app = FastAPI()
+        app.add_middleware(
+            _RequestBodySizeLimitMiddleware,
+            default_max_bytes=100,
+            path_limits={"/v1/images/": 200},
+        )
+
+        @app.post("/normal")
+        async def normal(request: Request):
+            body = await request.body()
+            return {"size": len(body)}
+
+        @app.post("/v1/images/generate")
+        async def images(request: Request):
+            body = await request.body()
+            return {"size": len(body)}
+
+        return app
+
+    def test_normal_route_under_limit(self) -> None:
+        client = TestClient(self._make_app())
+        resp = client.post("/normal", content=b"a" * 99)
+        assert resp.status_code == 200
+
+    def test_normal_route_over_limit(self) -> None:
+        client = TestClient(self._make_app())
+        resp = client.post("/normal", content=b"a" * 101)
+        assert resp.status_code == 413
+        assert resp.json()["error"]["code"] == "request_too_large"
+
+    def test_image_route_under_limit(self) -> None:
+        client = TestClient(self._make_app())
+        resp = client.post("/v1/images/generate", content=b"a" * 199)
+        assert resp.status_code == 200
+
+    def test_image_route_over_limit(self) -> None:
+        client = TestClient(self._make_app())
+        resp = client.post("/v1/images/generate", content=b"a" * 201)
+        assert resp.status_code == 413
+        assert resp.json()["error"]["code"] == "request_too_large"
 
 
 class TestGenericRouterHTTP:

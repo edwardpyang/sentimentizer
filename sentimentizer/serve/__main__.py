@@ -1,5 +1,11 @@
 import argparse
 import os
+import sys
+
+_DIFFUSION_MOVED_MESSAGE = (
+    "image generation moved to the imagenate service; see docs/serving.md. "
+    "Remove --diffusion and SENTIMENTIZER_DIFFUSION_ENABLED."
+)
 
 
 def _positive_int(value: str) -> int:
@@ -52,9 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--diffusion",
         action="store_true",
         default=env_diffusion,
-        help="Enable headless ComfyUI image endpoints. At least one model must be "
-        "explicitly enabled with its license and safety configuration. Can also be enabled via "
-        "SENTIMENTIZER_DIFFUSION_ENABLED.",
+        help="Removed. Exits with an error: image generation moved to the imagenate service.",
     )
     parser.add_argument(
         "--embeddings",
@@ -73,6 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> None:
     """Start the requested Serve application."""
+    if args.diffusion:
+        print(_DIFFUSION_MOVED_MESSAGE, file=sys.stderr)
+        sys.exit(2)
 
     if args.config:
         os.environ["SENTIMENTIZER_SERVE_CONFIG"] = args.config
@@ -105,7 +112,7 @@ def run(args: argparse.Namespace) -> None:
 
     from sentimentizer.serve.app import main
 
-    main(host=host, port=port, diffusion=args.diffusion)
+    main(host=host, port=port)
 
 
 if __name__ == "__main__":

@@ -250,10 +250,6 @@ diagnose:
 serve:
 	uv run --active python -m sentimentizer.serve
 
-## Start Ray Serve with all models including image generation (GPU required)
-serve-all:
-	uv run --active python -m sentimentizer.serve --diffusion
-
 # ──────────────────────────────────────────────
 # Testing & Linting
 # ──────────────────────────────────────────────
