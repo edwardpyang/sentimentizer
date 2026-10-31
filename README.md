@@ -114,6 +114,11 @@ its labeled data, and optional augmentation seeds. Each trained artifact saves
 its task definition; changing YAML alone does not retrain existing weights.
 See [reuse with external configurations](docs/router.md#reuse-with-external-configurations).
 
+The router also supports [independent evaluation, baseline comparisons, calibrated
+accept/abstain decisions, and explicit warmup/retry](docs/router.md#quality-calibration-and-decisions).
+Existing prediction responses keep their original shape; use `/v1/router/decide`
+or `/v1/router/decide/batch` with a calibrated artifact for acceptance decisions.
+
 ---
 
 ## Models

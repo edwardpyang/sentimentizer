@@ -253,3 +253,53 @@ def test_calibration_cli_saves_separate_artifact_and_rejects_overwrite(tmp_path,
     result = CliRunner().invoke(cli, args + [str(original)])
     assert result.exit_code != 0
     assert "different output-dir" in result.output
+
+
+def test_multiclass_calibration_retains_probability_label_mapping():
+    class OneHotBackbone:
+        def encode(self, texts, **kwargs):
+            return np.eye(3)[[int(text.split()[0]) for text in texts]]
+
+    def rows(partition):
+        return [
+            {"text": f"{label} {partition} {i}", "label": label}
+            for label in range(3)
+            for i in range(3)
+        ]
+
+    backbone = OneHotBackbone()
+    train = rows("train")
+    head = LogisticRegression().fit(
+        backbone.encode([row["text"] for row in train]), [row["label"] for row in train]
+    )
+    provenance = RouterProvenance()
+    add_dataset(provenance, "train", train)
+    model = RouterModel(
+        backbone,
+        head,
+        task=RouterTaskSpec(task_id="multiclass", labels=("a", "b", "c")),
+        provenance=provenance,
+    )
+    calibrated = calibrate_router(model, rows("calibration"), rows("policy"), min_accepted=1)
+    assert [item.label for item in calibrated.classify_batch(["0 test", "1 test", "2 test"])] == [
+        "a",
+        "b",
+        "c",
+    ]
+    np.testing.assert_allclose(
+        calibrated.probabilities_batch(["0 test", "1 test", "2 test"]).sum(axis=1), 1
+    )
+
+
+def test_calibration_supports_native_string_classes():
+    model = tiny_router()
+    train = records("train")
+    model.head = LogisticRegression().fit(
+        model.model_encode([row["text"] for row in train]),
+        [model.task.labels[row["label"]] for row in train],
+    )
+    calibrated = calibrate_router(model, records("calibration"), records("policy"), min_accepted=1)
+    assert [item.label for item in calibrated.classify_batch(["-1 test", "2 test"])] == [
+        "negative",
+        "positive",
+    ]

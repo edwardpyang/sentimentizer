@@ -1197,6 +1197,7 @@ class TestGenericRouterHTTP:
             RouterArtifactMetadata(task=task).model_dump_json()
         )
         predictor = SentimentPredictor.__new__(SentimentPredictor)
+        predictor._initialize_router_state()
         predictor._router_model_path = str(tmp_path)
         predictor.router = None
         predictor._router_error = None

@@ -42,17 +42,27 @@ def prepare_seeds(seeds: list[dict], task: RouterTaskSpec) -> list[dict]:
     """Attach stable seed and source identities, preserving caller metadata."""
     prepared = []
     seen: set[str] = set()
+    labels_by_text: dict[str, int] = {}
     for seed in seeds:
         label = task.label_id(seed.get("label"))
         if not isinstance(seed.get("text"), str) or not seed["text"].strip():
             raise ValueError("Augmentation seeds require nonempty text")
+        key = text_key(seed["text"])
+        if key in labels_by_text and labels_by_text[key] != label:
+            raise ValueError("Duplicate augmentation seeds have conflicting labels")
+        labels_by_text[key] = label
         identity = json.dumps([task.task_id, task.taxonomy_version, label, text_key(seed["text"])])
         seed_id = hashlib.sha256(identity.encode()).hexdigest()
         if seed_id in seen:
             continue
         seen.add(seed_id)
         prepared.append(
-            {**seed, "seed_id": seed_id, "group_id": seed.get("group_id", seed_id), "is_seed": True}
+            {
+                **seed,
+                "seed_id": seed_id,
+                "group_id": seed["group_id"] if seed.get("group_id") is not None else seed_id,
+                "is_seed": True,
+            }
         )
     return prepared
 
@@ -106,9 +116,11 @@ def _resume_records(existing: list[dict], seeds: list[dict], task: RouterTaskSpe
             continue
         seen[key] = row["label"]
         if row.get("seed_id") is None and key in by_text:
+            if row["label"] != by_text[key]["label"]:
+                raise ValueError("Resume seed label conflicts with the supplied seed")
             row = by_text[key]
         parent = by_id.get(row.get("seed_id"))
-        if parent is None or row.get("is_seed") not in (True, False):
+        if parent is None or not isinstance(row.get("is_seed"), bool):
             raise ValueError("Cannot resume legacy variations without seed lineage; regenerate")
         if row["label"] != parent["label"] or row.get("group_id") != parent["group_id"]:
             raise ValueError("Resume record conflicts with its seed label or source group")

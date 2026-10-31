@@ -3,6 +3,7 @@
 import json
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 from click.testing import CliRunner
 
@@ -116,21 +117,24 @@ def test_resume_repairs_truncated_tail_but_rejects_ambiguous_legacy_rows(tmp_pat
         augment_seeds([seed], output_path=str(path), resume=True)
 
 
-def test_split_cli_writes_three_disjoint_partitions(tmp_path):
+@pytest.mark.parametrize("with_calibration", [False, True])
+def test_split_cli_writes_disjoint_partitions(tmp_path, with_calibration):
     from workflows.cli import cli
 
     data = tmp_path / "sources.jsonl"
     data.write_text("".join(json.dumps(row) + "\n" for row in source_rows()))
     output = tmp_path / "split"
-    result = CliRunner().invoke(
-        cli, ["router", "split", "--data", str(data), "--output-dir", str(output)]
-    )
+    args = ["router", "split", "--data", str(data), "--output-dir", str(output)]
+    if with_calibration:
+        args += ["--calibration-size", "0.1", "--policy-size", "0.1"]
+    result = CliRunner().invoke(cli, args)
     assert result.exit_code == 0, result.output
     from sentimentizer.router.dataset import load_router_records
 
-    partitions = [
-        load_router_records(output / f"{name}.jsonl") for name in ("train", "validation", "test")
-    ]
+    names = ["train", "validation", "test"] + (
+        ["calibration", "policy"] if with_calibration else []
+    )
+    partitions = [load_router_records(output / f"{name}.jsonl") for name in names]
     assert_disjoint(*partitions)
     assert sum(map(len, partitions)) == len(source_rows())
 
@@ -139,3 +143,27 @@ def test_seed_identity_is_stable_and_task_scoped():
     first = prepare_seeds([{"text": "Seed", "label": 0}], FOOD_TASK_SPEC)[0]
     second = prepare_seeds([{"text": " SEED ", "label": 0}], FOOD_TASK_SPEC)[0]
     assert first["seed_id"] == second["seed_id"]
+
+
+def test_resume_does_not_silently_relabel_old_seed_rows(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    path.write_text(json.dumps({"text": "seed", "label": 1}) + "\n")
+    with pytest.raises(ValueError, match="conflicts"):
+        augment_seeds([{"text": "seed", "label": 0}], output_path=str(path), resume=True)
+
+
+def test_null_source_still_gets_seed_lineage_and_numpy_ids_fingerprint():
+    from sentimentizer.router.dataset import dataset_fingerprint
+
+    seed = prepare_seeds([{"text": "seed", "label": 0, "group_id": None}], FOOD_TASK_SPEC)[0]
+    assert seed["group_id"] == seed["seed_id"]
+    assert dataset_fingerprint([{"text": "seed", "label": np.int64(0)}]) == dataset_fingerprint(
+        [{"text": "seed", "label": 0}]
+    )
+
+
+def test_source_identifiers_retain_case_while_text_duplicates_are_normalized():
+    assert_disjoint(
+        [{"text": "first", "label": 0, "group_id": "A"}],
+        [{"text": "second", "label": 1, "group_id": "a"}],
+    )

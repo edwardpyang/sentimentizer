@@ -191,6 +191,19 @@ Both the full and BGE-M3-only applications expose `/health/live`,
 
 ### Router (Review Categorization) Endpoints
 
+In addition to classification, a calibrated artifact supports
+`POST /v1/router/decide` and `POST /v1/router/decide/batch` with the same text/texts
+requests. Their prediction objects add `decision: "accept" | "abstain"` while
+preserving the topic label. Existing prediction endpoints keep their shape.
+Decision endpoints return 503 when the artifact has no acceptance policy.
+
+`GET /health/router` reports router readiness and decision readiness independently
+of sentiment, with 503 until the router is loaded; it never triggers loading.
+`POST /v1/router/load` with `{}` warms up the router; `{"retry_failed": true}`
+explicitly retries a cached failure. Concurrent loads join the active attempt
+within each replica. See the [quality and operations guide](router.md#quality-calibration-and-decisions)
+for dataset separation, calibration, full contracts and Python equivalents.
+
 The router uses a SentenceTransformer backbone and LogisticRegression head.
 Its default categories are `dietary`, `service`, and `general`; custom artifacts
 provide their own vocabulary. Each route

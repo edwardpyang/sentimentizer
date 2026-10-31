@@ -112,6 +112,11 @@ def benchmark_router(
     joblib.dump(lexical, artifact)
     (config.output_dir / "tfidf_task.json").write_text(config.task.model_dump_json(indent=2))
     report["runs"]["tfidf"] = {
+        "training_config": {
+            "ngram_range": list(TFIDF_NGRAM_RANGE),
+            "head_max_iter": config.head_max_iter,
+            "seed": config.seed,
+        },
         **prediction_metrics(
             targets, labels, probabilities.max(axis=1).tolist(), list(config.task.labels)
         ),

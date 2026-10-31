@@ -6,6 +6,8 @@ from typing import Annotated, Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 NonemptyString = Annotated[str, Field(min_length=1, pattern=r"\S")]
+DEFAULT_MIN_ACCURACY = 0.95
+DEFAULT_MIN_ACCEPTED = 20
 
 
 class RouterTaskSpec(BaseModel):
@@ -57,8 +59,8 @@ class RouterAcceptancePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
-    min_accuracy: float = Field(default=0.95, gt=0, le=1, allow_inf_nan=False)
-    min_accepted: int = Field(default=20, ge=1)
+    min_accuracy: float = Field(default=DEFAULT_MIN_ACCURACY, gt=0, le=1, allow_inf_nan=False)
+    min_accepted: int = Field(default=DEFAULT_MIN_ACCEPTED, ge=1)
     examples: int = Field(ge=1)
     accepted: int = Field(ge=0)
     accuracy: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)

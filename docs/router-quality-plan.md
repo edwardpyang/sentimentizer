@@ -1,8 +1,19 @@
 # Router reliability, evaluation, and decisions
 
-**Status:** ⏳ Partially implemented — 2026-10-31
+**Status:** ✅ Completed — 2026-10-31
 
 _Original status: 📋 Not started — 2026-10-31_
+
+_Previous status: ⏳ Partially implemented — 2026-10-31_
+
+All three milestones are implemented. Final `make ci`: 762 passed, 1 skipped,
+zero pyright errors, successful formatting/lint and wheel/sdist builds.
+The six deterministic concurrency cases passed alone; HTTP and compatibility
+tests passed. An additional offline smoke run exercised the actual benchmark,
+calibrate, and evaluate CLI commands with a tiny trainable sentence encoder and
+real sklearn heads, writing and reloading artifacts. It verifies workflow wiring,
+not production model quality. No production backbone or human-labeled benchmark
+was downloaded or evaluated. GitHub main was rechecked at d5396bd before publication.
 
 Milestone 1 is implemented. Focused tests: 68 passed. `make ci`: 728 passed,
 2 skipped; lint/type checks and wheel/sdist builds passed. Local tests use the
@@ -14,6 +25,13 @@ joblib persistence, CLI calibration, all three benchmark result paths, and a
 tiny offline trainable sentence encoder trained twice and reloaded. Source
 inspection found fit() resets the training seed through default Trainer args;
 the native old_fit() loop preserves the explicitly configured RNG seed.
+
+Final review revised lifecycle reads to take short state snapshots under the
+same condition as publication; construction and metadata file reads stay outside
+the condition. Also added explicit warmup/retry HTTP control and optional
+calibration/policy fractions to the split CLI so the five-way data workflow can
+be run without reusing the training validation file. Null source IDs receive
+stable seed lineage, and fingerprints support native NumPy integer labels.
 
 ## Goal and scope
 

@@ -37,6 +37,10 @@ _sentence_transformers: Any = None
 _joblib: Any = None
 
 
+class RouterPolicyUnavailableError(RuntimeError):
+    """Signal that classification is available but calibrated decisions are not."""
+
+
 def _get_sentence_transformers() -> Any:
     """Lazy import sentence_transformers."""
     global _sentence_transformers
@@ -353,7 +357,9 @@ class RouterModel:
     def decide_batch(self, texts: list[str]) -> list[RouterDecision]:
         """Apply the saved acceptance policy without changing the predicted label."""
         if self.acceptance_policy is None:
-            raise RuntimeError("Router has no acceptance policy; calibrate the artifact first")
+            raise RouterPolicyUnavailableError(
+                "Router has no acceptance policy; calibrate the artifact first"
+            )
         threshold = self.acceptance_policy.threshold
         return [
             RouterDecision(

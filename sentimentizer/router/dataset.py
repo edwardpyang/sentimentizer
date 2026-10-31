@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import unicodedata
+from numbers import Integral
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -30,7 +31,11 @@ def record_keys(records: list[dict]) -> dict[str, list[str]]:
     return {
         "texts": sorted({text_key(row["text"]) for row in records}),
         "groups": sorted(
-            {text_key(str(row["group_id"])) for row in records if row.get("group_id") is not None}
+            {
+                hashlib.sha256(str(row["group_id"]).encode()).hexdigest()
+                for row in records
+                if row.get("group_id") is not None
+            }
         ),
     }
 
@@ -53,7 +58,12 @@ def assert_disjoint_keys(*partitions: dict[str, list[str]]) -> None:
 def dataset_fingerprint(records: list[dict]) -> str:
     """Fingerprint labeled inputs independently of their row order."""
     content = sorted(
-        (text_key(row["text"]), row["label"], str(row.get("group_id", ""))) for row in records
+        (
+            text_key(row["text"]),
+            int(row["label"]) if isinstance(row["label"], Integral) else row["label"],
+            str(row.get("group_id", "")),
+        )
+        for row in records
     )
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 

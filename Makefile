@@ -5,7 +5,7 @@
  	   upload-rnn upload-encoder upload-decoder upload-modernbert upload-router \
  	   download-rnn download-encoder download-decoder download-modernbert \
  	   push-hub pull-hub diagnose diagnose-env diagnose-pipeline \
- 	   router-augment router-train router-evaluate router-pipeline upload-router
+       router-split router-augment router-train router-evaluate router-pipeline upload-router
 
 # Default device: use auto-detect (cuda > mps > cpu)
 DEVICE ?= auto
@@ -176,11 +176,11 @@ router-split:
 router-augment:
 	uv run sentimentizer router augment --seeds $(ROUTER_DATA_DIR)/train.jsonl --output $(ROUTER_DATA_DIR)/train.augmented.jsonl
 
-## Train the SetFit router model
+## Train the sentence encoder router
 router-train:
 	uv run sentimentizer router train --data $(ROUTER_DATA_DIR)/train.augmented.jsonl --validation-data $(ROUTER_DATA_DIR)/validation.jsonl
 
-## Evaluate the SetFit router model
+## Evaluate on independent held-out sources
 router-evaluate:
 	uv run sentimentizer router evaluate --model-path models/router --data $(ROUTER_DATA_DIR)/test.jsonl
 

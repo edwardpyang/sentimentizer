@@ -8,13 +8,14 @@ import numpy as np
 
 from sentimentizer.router.dataset import assert_disjoint, assert_disjoint_keys, record_keys
 from sentimentizer.router.provenance import add_dataset
-from sentimentizer.router.schemas import RouterAcceptancePolicy
+from sentimentizer.router.schemas import (
+    DEFAULT_MIN_ACCEPTED,
+    DEFAULT_MIN_ACCURACY,
+    RouterAcceptancePolicy,
+)
 
 if TYPE_CHECKING:
     from sentimentizer.router.model import RouterModel
-
-DEFAULT_MIN_ACCURACY = 0.95
-DEFAULT_MIN_ACCEPTED = 20
 
 
 def select_acceptance_policy(

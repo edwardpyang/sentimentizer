@@ -2,7 +2,7 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from sentimentizer.router.schemas import RouterClassification
+from sentimentizer.router.schemas import RouterClassification, RouterDecision
 from sentimentizer.serve.config import cfg
 
 
@@ -277,10 +277,10 @@ class RouterBatchResultItem(_RouterResponseModel):
     prediction: RouterPrediction
 
 
-class RouterBatchResponse(_RouterResponseModel):
-    """Response from /v1/router/batch."""
+class _RouterBatchEnvelope[T](_RouterResponseModel):
+    """Validate complete batches for both classification and decision results."""
 
-    results: list[RouterBatchResultItem]
+    results: list[T]
     count: int = Field(strict=True, ge=0)
     latency_s: float = Field(strict=True, ge=0, allow_inf_nan=False)
 
@@ -290,6 +290,10 @@ class RouterBatchResponse(_RouterResponseModel):
         if self.count != len(self.results):
             raise ValueError("Router batch count must match results")
         return self
+
+
+class RouterBatchResponse(_RouterBatchEnvelope[RouterBatchResultItem]):
+    """Response from /v1/router/batch."""
 
     model_config = {
         "json_schema_extra": {
@@ -310,6 +314,43 @@ class RouterBatchResponse(_RouterResponseModel):
             ]
         }
     }
+
+
+class RouterDecisionPrediction(RouterPrediction, RouterDecision):
+    """Include token counts alongside a topic and acceptance decision."""
+
+
+class RouterDecisionResultItem(_RouterResponseModel):
+    """Wrap one policy decision."""
+
+    prediction: RouterDecisionPrediction
+
+
+class RouterDecisionResponse(_RouterResponseModel):
+    """Response from /v1/router/decide."""
+
+    prediction: RouterDecisionPrediction
+    latency_s: float = Field(strict=True, ge=0, allow_inf_nan=False)
+
+
+class RouterDecisionBatchResponse(_RouterBatchEnvelope[RouterDecisionResultItem]):
+    """Response from /v1/router/decide/batch."""
+
+
+class RouterLoadRequest(_RouterResponseModel):
+    """Require an explicit operator choice before retrying a cached failure."""
+
+    retry_failed: bool = Field(default=False, strict=True)
+
+
+class RouterReadinessResponse(_RouterResponseModel):
+    """Describe router readiness independently of the sentiment model."""
+
+    status: Literal["ready", "not_ready"]
+    router_loaded: bool
+    router_loading: bool
+    router_error: str | None
+    decision_ready: bool
 
 
 class RouterModelsResponse(_RouterResponseModel):

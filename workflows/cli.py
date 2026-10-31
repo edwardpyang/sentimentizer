@@ -406,8 +406,16 @@ def router_train(
     type=click.FloatRange(min=0, max=1, min_open=True, max_open=True),
 )
 @click.option("--seed", default=42, type=int)
+@click.option("--calibration-size", default=0.0, type=click.FloatRange(min=0, max=1, max_open=True))
+@click.option("--policy-size", default=0.0, type=click.FloatRange(min=0, max=1, max_open=True))
 def router_split(
-    data: str, output_dir: str, test_size: float, validation_size: float, seed: int
+    data: str,
+    output_dir: str,
+    test_size: float,
+    validation_size: float,
+    seed: int,
+    calibration_size: float,
+    policy_size: float,
 ) -> None:
     """Split original sources BEFORE augmenting the training partition."""
     from pathlib import Path
@@ -419,12 +427,24 @@ def router_split(
         split_router_records,
     )
 
-    if test_size + validation_size >= 1:
-        raise click.UsageError("test-size + validation-size must be less than one")
-    train, test = split_router_records(load_router_records(data), test_size, seed)
-    train, validation = split_router_records(train, validation_size / (1 - test_size), seed)
-    assert_disjoint(train, validation, test)
-    for name, rows in (("train", train), ("validation", validation), ("test", test)):
+    sizes = {
+        "test": test_size,
+        "validation": validation_size,
+        "calibration": calibration_size,
+        "policy": policy_size,
+    }
+    if sum(sizes.values()) >= 1:
+        raise click.UsageError("Held-out split fractions must sum to less than one")
+    train = load_router_records(data)
+    remaining = 1.0
+    partitions = {}
+    for name, size in sizes.items():
+        if size:
+            train, partitions[name] = split_router_records(train, size / remaining, seed)
+            remaining -= size
+    partitions["train"] = train
+    assert_disjoint(*partitions.values())
+    for name, rows in partitions.items():
         save_dataset_to_jsonl(rows, str(Path(output_dir) / f"{name}.jsonl"))
         click.echo(f"{name}: {len(rows)} records")
 

@@ -121,6 +121,9 @@ sentimentizer/
     dataset.py         — JSONL loader, train/test split
     train_router.py    — Contrastive fine-tune + LogisticRegression head fit
     evaluate.py        — Similarity heatmap, threshold calibration
+    calibration.py     — Frozen-head probability calibration and acceptance policy selection
+    provenance.py      — Dataset fingerprints, used-data hashes, run configuration/versions
+    benchmark.py       — TF-IDF, frozen encoder, and contrastive encoder comparison
   agent/
     diagnose_model.py  — Tuning/diagnosis agent
     websearch.py       — Typed web search tool
@@ -280,6 +283,14 @@ required after any dashboard change.
   `[0,1]`; counts and latency are nonnegative; batches must be complete. Labels
   come from the loaded artifact and probabilities follow `head.classes_` order.
   Keep additional task configurations external to the food-focused defaults.
+- **Router quality and decisions:** Split original source groups before
+  augmentation. Preserve `group_id` through generated variants. Training,
+  validation, calibration, policy selection and test data must be disjoint;
+  artifact provenance records used text/source hashes and evaluation rejects
+  overlap. `RouterModel.decide_batch()` and `/v1/router/decide{,/batch}` expose
+  accept/abstain separately from the topic label. Classification responses stay
+  compatible. Decision endpoints require a saved acceptance policy. Failed
+  operating targets produce abstain-all; no threshold implies no acceptance.
 - **FastAPI + `@serve.ingress`, one app per deployment.** There is **no mounted
   `v1` sub-app** — routes declare their full path on the app returned by
   `create_fastapi_app()`, e.g. `@app.post("/v1/sentiment/predict")`. Health
@@ -336,6 +347,12 @@ required after any dashboard change.
   handlers let `classify_batch` trigger the load and catch failures → 503; they
   must not pre-guard on `router_loaded`. `get_router_model_info()` reports
   `"not_loaded"` before first use.
+  A per-predictor condition elects one load owner and publishes terminal state;
+  never hold it during construction/network I/O. All exit paths notify waiters.
+  `load_router()` preserves memoized failure; `retry_router_load()` explicitly
+  retries it or joins an active attempt. POST `/v1/router/load` exposes these
+  with strict `retry_failed: bool = false`. GET `/health/router` reads readiness
+  without triggering loading and reports decision readiness separately.
 
 ### Ray Serve environment
 

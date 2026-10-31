@@ -73,6 +73,7 @@ from starlette.responses import Response as StarletteResponse
 
 from sentimentizer import logger
 from sentimentizer.predictor import _MODEL_CONFIGS, SentimentPredictor
+from sentimentizer.router.model import RouterPolicyUnavailableError
 from sentimentizer.serve.base import (
     PROMETHEUS_CONTENT_TYPE,
     ServiceMetrics,
@@ -98,8 +99,12 @@ from sentimentizer.serve.models import (
     PredictResponse,
     RouterBatchResponse,
     RouterBatchResultItem,
+    RouterDecisionBatchResponse,
+    RouterDecisionResponse,
+    RouterLoadRequest,
     RouterModelsResponse,
     RouterPredictResponse,
+    RouterReadinessResponse,
     TokenizeRequest,
     TokenizeResponse,
 )
@@ -471,6 +476,16 @@ class SentimentizerDeployment:
         results = await asyncio.to_thread(self.predictor.classify_batch, texts)
         return results
 
+    @serve.batch(
+        max_batch_size=cfg.classify_batch_size,
+        batch_wait_timeout_s=cfg.classify_batch_wait_s,
+    )
+    async def decide_route(self, inputs: list[dict]) -> list[dict]:
+        """Auto-batch individual acceptance-policy requests."""
+        return await asyncio.to_thread(
+            self.predictor.decide_batch, [item["text"] for item in inputs]
+        )
+
     # ------------------------------------------------------------------
     # Sentiment handlers (v1/sentiment prefix)
     # Old /v1/* paths are kept as deprecated aliases.
@@ -717,6 +732,90 @@ class SentimentizerDeployment:
         """GET /v1/router/models -- router model metadata."""
         self._require_ready()
         return RouterModelsResponse.model_validate(self.predictor.get_router_model_info())
+
+    async def _router_decisions(
+        self, texts: list[str], request: Request, *, auto_batch: bool = False
+    ) -> RouterDecisionBatchResponse:
+        """Validate complete decision results before accounting for success."""
+        self._require_ready()
+        started = time.perf_counter()
+        try:
+            if auto_batch:
+                results = [await self.decide_route({"text": texts[0]})]
+            else:
+                results = await asyncio.to_thread(self.predictor.decide_batch, texts)
+            if len(results) != len(texts):
+                raise ValueError("Router decisions must match the number of inputs")
+            response = RouterDecisionBatchResponse(
+                results=results, count=len(results), latency_s=time.perf_counter() - started
+            )
+        except Exception as exc:
+            self._router_metrics.record_request(time.perf_counter() - started, error=True)
+            if isinstance(exc, RouterPolicyUnavailableError):
+                raise HTTPException(status_code=503, detail=str(exc)) from None
+            if not self.predictor.router_loaded:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Router model not loaded: {self.predictor.router_error}",
+                ) from None
+            raise
+        self._router_metrics.record_request(response.latency_s)
+        logger.info(
+            "router decisions completed",
+            request_id=getattr(request.state, "request_id", "unknown"),
+            batch_size=len(texts),
+            accepted=sum(item.prediction.decision == "accept" for item in response.results),
+            duration_s=response.latency_s,
+        )
+        return response
+
+    @app.post("/v1/router/decide", response_model=RouterDecisionResponse)
+    async def router_decide(self, body: PredictRequest, request: Request) -> RouterDecisionResponse:
+        """Return a topic and separate accept/abstain decision (auto-batched)."""
+        result = await self._router_decisions([body.text], request, auto_batch=True)
+        return RouterDecisionResponse(
+            prediction=result.results[0].prediction, latency_s=result.latency_s
+        )
+
+    @app.post("/v1/router/decide/batch", response_model=RouterDecisionBatchResponse)
+    async def router_decide_batch(
+        self, body: BatchRequest, request: Request
+    ) -> RouterDecisionBatchResponse:
+        """Apply the saved policy to a complete batch in input order."""
+        return await self._router_decisions(body.texts, request)
+
+    @app.post("/v1/router/load", response_model=RouterModelsResponse)
+    async def router_load(self, body: RouterLoadRequest) -> RouterModelsResponse:
+        """Warm up the router; retry failure only when explicitly requested."""
+        self._require_ready()
+        operation = (
+            self.predictor.retry_router_load if body.retry_failed else self.predictor.load_router
+        )
+        loaded = await asyncio.to_thread(operation)
+        if not loaded:
+            raise HTTPException(
+                status_code=503, detail=f"Router model not loaded: {self.predictor.router_error}"
+            )
+        return RouterModelsResponse.model_validate(self.predictor.get_router_model_info())
+
+    @app.get("/health/router", response_model=None)
+    async def health_router(self) -> RouterReadinessResponse | JSONResponse:
+        """Read readiness without loading or waiting for router construction."""
+        loaded = self.predictor is not None and self.predictor.router_loaded
+        body = RouterReadinessResponse(
+            status="ready" if loaded else "not_ready",
+            router_loaded=loaded,
+            router_loading=self.predictor.router_loading if self.predictor is not None else False,
+            router_error=self.predictor.router_error
+            if self.predictor is not None
+            else self._load_error,
+            decision_ready=self.predictor.router_decisions_ready
+            if self.predictor is not None
+            else False,
+        )
+        if not loaded:
+            return JSONResponse(status_code=503, content=body.model_dump(mode="json"))
+        return body
 
     # ------------------------------------------------------------------
     # Infrastructure handlers (unversioned)

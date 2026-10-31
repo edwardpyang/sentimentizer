@@ -113,7 +113,9 @@ Training JSONL uses `text` and integer `label`, where IDs follow the order of
 fractional, and out-of-range IDs are rejected. Extra fields such as `group_id`
 are preserved by JSONL saves and inherited by generated variations. Split related
 examples together when preparing independent evaluation data; the built-in
-training split remains a random row split.
+training split keeps source groups and normalized duplicates together. Every class
+must have enough independent source groups to appear in each partition. Missing
+`group_id` allows only exact-duplicate checks; it cannot establish paraphrase independence.
 
 ```bash
 sentimentizer router augment --config /path/to/requests.yaml
@@ -154,7 +156,8 @@ sentimentizer router augment \
   --output "augmented_yelp.jsonl"
 ```
 
-To resume an interrupted generation, add the `--resume` flag to skip already-generated seeds and append new variations.
+To resume an interrupted generation, add `--resume` to request missing variations
+for incomplete seeds. Progress is counted from accepted unique variations.
 
 ---
 
@@ -190,7 +193,7 @@ JSON and uses every row in the supplied file, which should be independent of tra
 make router-evaluate
 
 # Or run via CLI
-sentimentizer router evaluate --model-path models/router --data augmented_yelp.jsonl
+sentimentizer router evaluate --model-path models/router --data data/router/split/test.jsonl
 ```
 
 ---
@@ -207,7 +210,154 @@ make upload-router
 sentimentizer router push --model-path models/router --repo-id your-username/sentimentizer-router
 ```
 
-Run the whole pipeline (augment → train → evaluate) with `make router-pipeline`.
+Run the whole pipeline (split → augment → train → evaluate) with `make router-pipeline`.
+
+The Makefile pipeline now requires labeled original sources at
+`data/router/reviews.jsonl` (`ROUTER_RAW_DATA` overrides this) and writes independent
+partitions to `data/router/split` (`ROUTER_DATA_DIR`). It splits **before**
+augmentation, augments only training sources, uses validation during training,
+and evaluates only on the test file. It stops if augmentation is incomplete.
+
+## Quality, calibration, and decisions
+
+### Collect and reserve independent data
+
+Collect representative real inputs and have people annotate them using a written
+policy. Keep their original source/review/conversation ID in `group_id`; all
+paraphrases and snippets from the same source inherit it. Record annotation
+provenance in additional fields. The 30 bundled seeds are an augmentation starter,
+not a production benchmark. Synthetic generation checks labels structurally;
+sample and audit their semantic correctness before training.
+
+For the shipped food task, use this annotation policy when building a new dataset:
+
+| Input meaning | Primary label |
+|---|---|
+| An explicit restriction, allergy, suitability question, or accommodation issue, including staff handling it | dietary |
+| Staff, waiting, reservations, or order handling without a dietary issue | service |
+| Taste, ambiance, price, or other topics without either issue above | general |
+
+For mixed-topic inputs, dietary takes precedence over service, then general.
+Mentioning an ingredient alone is insufficient: "the bread was dry" is general;
+"the gluten-free bread was dry" is dietary. "The waiter checked my nut allergy"
+is dietary; "I have no allergies; the waiter was rude" is service. Label the
+meaning of the whole input, including negation. Keep difficult mixed-topic,
+negation, spelling, long-review, and out-of-domain examples as separate review
+slices. Resolve disagreements before generating variants. Record a new
+`taxonomy_version` if adopting this changes an existing task's annotation policy;
+the code does not impose these food rules on external tasks or rewrite old artifacts.
+Put the same precedence rule in the external task's `label_descriptions` so the
+augmentation prompt and annotation guide agree.
+
+Reserve calibration and policy-selection files in addition to train/validation/test:
+
+```bash
+sentimentizer router split --data labeled_reviews.jsonl --output-dir data/router/split \
+  --calibration-size 0.1 --policy-size 0.1
+sentimentizer router augment --seeds data/router/split/train.jsonl \
+  --output data/router/split/train.augmented.jsonl
+sentimentizer router train --data data/router/split/train.augmented.jsonl \
+  --validation-data data/router/split/validation.jsonl --output-dir models/router
+```
+
+The default split reserves 20% each for validation/test; optional calibration and
+policy fractions are additional. Fractions are approximate for unequal groups.
+The splitter connects source groups linked by duplicate texts, rejects conflicting
+duplicate labels, and fails when it cannot retain every class in each split.
+Use at least five independent source groups per class for five partitions; more
+may be required for the requested fractions or connected groups.
+
+Augmentation adds stable `seed_id`, `group_id`, `is_seed`, and generator metadata.
+`--resume` counts unique accepted variations per seed, including after an interrupted
+final write. It retries shortfalls up to three attempts per invocation. Exhausted
+attempts leave recoverable output and a failing CLI exit code. Old seed-only files
+can resume; legacy generated rows without lineage must be regenerated. Use one
+writer per output file. Changing the task or seed/source identities requires a new
+output file rather than guessing lineage.
+
+### Compare training approaches
+
+```bash
+sentimentizer router benchmark --train-data data/router/split/train.augmented.jsonl \
+  --validation-data data/router/split/validation.jsonl \
+  --test-data data/router/split/test.jsonl --output-dir models/router-comparison
+```
+
+This fits TF-IDF + logistic regression, frozen sentence embeddings + logistic
+regression, and the contrastively tuned encoder on identical inputs. It saves
+the models and `benchmark_report.json`: per-class precision/recall/F1, macro-F1,
+confusion matrices, reliability bins/expected calibration error, accuracy versus
+coverage, warmed single-request p95 latency, batch throughput, training time,
+and whole-process RSS before/after training. Sequential runs share libraries and
+caches: RSS is neither isolated model memory nor GPU memory. TF-IDF is saved as a
+sklearn pipeline, not a serving-compatible RouterModel. These are measured local
+results; do not use unit-test fixtures to claim production model quality.
+
+Training honors the configured seed for pair sampling, PyTorch initialization,
+shuffling and the classifier. `training_mode` selects `contrastive` (default) or
+`frozen`; `learning_rate`, `warmup_ratio`, and `head_max_iter` are configurable in
+YAML or `SENTIMENTIZER_ROUTER_*` environment variables. The native contrastive
+training loop avoids the compatibility `fit()` wrapper's default Trainer seed.
+Artifacts record configuration, installed package versions, dataset fingerprints,
+and the resolved backbone revision when available. GPU bitwise determinism is not
+promised. Validation metrics are saved to `validation_report.json`.
+
+### Calibrate and select an operating point
+
+```bash
+sentimentizer router calibrate --model-path models/router \
+  --calibration-data data/router/split/calibration.jsonl \
+  --policy-data data/router/split/policy.jsonl \
+  --min-accuracy 0.95 --min-accepted 20 --output-dir models/router-calibrated
+sentimentizer router evaluate --model-path models/router-calibrated \
+  --data data/router/split/test.jsonl
+```
+
+The head stays frozen while sigmoid probability calibration is fitted on the
+calibration file. Threshold selection uses the separate policy file and maximizes
+observed coverage subject to the requested accuracy and minimum accepted count.
+Equal-confidence inputs stay together. If no threshold qualifies, the saved policy
+abstains on every input. This is empirical evidence, not an accuracy guarantee or
+an out-of-domain detector. Measure final accepted accuracy and coverage on the
+untouched test set and review behavior on challenging and out-of-domain inputs.
+
+All these partitions must be disjoint by source and normalized text. Artifact
+metadata retains hashes for all data used in training, validation, calibration,
+and policy selection; evaluation rejects known overlap. Hashes detect known
+overlap rather than certifying independent data collection. Calibration requires
+training provenance, so retrain legacy artifacts first. Legacy artifacts can
+still be classified/evaluated, with a warning that independence is unverified.
+
+### Serve explicit decisions
+
+Existing `/v1/router/predict` and `/v1/router/batch` still return their original
+prediction shapes. To use the acceptance policy, point `ROUTER_MODEL_PATH` at the
+calibrated artifact and call the separate decision API:
+
+```json
+{"prediction": {"label": "dietary", "score": 0.72, "token_count": 8,
+                "decision": "abstain"}, "latency_s": 0.01}
+```
+
+`POST /v1/router/decide` accepts `{"text": "..."}` and is auto-batched.
+`POST /v1/router/decide/batch` accepts `{"texts": ["...", "..."]}` and returns
+`results`, `count`, and `latency_s`. The topic label stays intact even when the
+decision is `abstain`; `general` remains a topic. Artifacts without an acceptance
+policy return 503 on decision endpoints while classification remains available.
+Standalone Python uses `RouterModel.decide_batch()`; the high-level predictor
+adds `decide()` and `decide_batch()` prediction envelopes with token counts.
+
+`GET /health/router` is independent of sentiment readiness. It returns 503 until
+a router is loaded and reports `router_loading`, `router_error`, and
+`decision_ready`; it never loads/downloads a model. A loaded router without a
+policy is classification-ready with `decision_ready: false`.
+
+`POST /v1/router/load` with `{}` warms up the router. Failures remain cached;
+`{"retry_failed": true}` explicitly retries a failed attempt. Concurrent calls
+join the same attempt within each predictor/replica. Construction runs outside
+the state condition, and failures/interruption notify waiters. Each replica owns
+its own model; this does not share loaded weights across processes. Python
+operators can call `load_router()` and `retry_router_load()` directly.
 
 ---
 
