@@ -1,6 +1,6 @@
 # Image Service Extraction — Implementation Plan
 
-**Status:** ⏳ Partially implemented (2026-10-31). M1-M4b are done on the `extract-from-sentimentizer` branch in `imagenate`. M5 needs a deployment decision. M6-M7 are ready on `remove-image-service` and wait on M5.
+**Status:** ⏳ Partially implemented (2026-10-31). M1-M4b are done on the `extract-from-sentimentizer` branch in `imagenate`. The image flow has never run in production, so M5 reduces to generating real images once (see M5). M6-M7 are ready on `remove-image-service` and wait on that.
 
 _Original status: 📋 Not started (2026-10-31)_
 
@@ -122,6 +122,7 @@ imagenate/
   Makefile                            NEW  check / typecheck / test / ci / serve (mirrors sentimentizer targets)
   Dockerfile                          NEW  no torch
   Dockerfile.comfyui                  NEW  ComfyUI sidecar at COMFYUI_REVISION; weights are mounted, not baked in
+  compose.yaml, compose.cpu.yaml      NEW  local stack with the same shape as the pod; the override checks wiring without a GPU
   AGENTS.md, CLAUDE.md                NEW  full agent guide for this repo (CLAUDE.md is a symlink)
   LICENSE, .gitignore, .dockerignore  NEW  .gitignore is new, not copied: sentimentizer's ignores *.json, which would drop the OpenAPI fixture
   .rules/                             NEW  all seven rule files, rewritten for this repo where they named sentiment code
@@ -439,10 +440,12 @@ first push.
 
 ### M5. Cutover (ops, no code) — **not done**
 
-First confirm where images actually run. The repo's `k8s/` manifests and Dockerfile do not
-serve images today: the default `EXTRAS` omits `diffusion`, the deployment sets no image env,
-and no ComfyUI sidecar exists. If nothing outside `make serve-all` serves images, this is a
-first deployment and an env translation, not a cutover, and steps 2 and 4 may not apply.
+**Update (2026-10-31): the image flow has never been run against ComfyUI or deployed**, confirmed by
+the owner and consistent with the repo: the `k8s/` manifests and Dockerfile omit the `diffusion`
+extra, set no image env, and have no sidecar. There are no clients to cut over, jobs to lose, or
+ingress rule to swap, and the soak period protects nothing. The gate for M6 becomes this: **one
+real generation per model that will be used, on a GPU, through `make docker-up` in imagenate, with
+the output image inspected.** The steps below apply only if a deployment is added first.
 
 1. Deploy the new service with the current image config translated to `IMAGENATE_*` names per the rename table, and the same secret values (API keys, moderation key).
 2. Add the `/v1/images` ingress rule. NGINX ingress picks the longest matching Prefix path, so it takes precedence over `/`.
@@ -622,7 +625,8 @@ service is unrelated to sentiment. Review of that change:
 - (e) M1 could not pass its own gate before M2's config existed. The repo's existing initial commit also needed an unrelated-histories merge.
 - (f) Copying sentimentizer's `.gitignore` would have dropped the JSON fixture, since it ignores `*.json`.
 - (g) Discovery missed `test_safety.py`, `ImageModelsStatus`, the dead `is_safe` after M6, and the `LOG_LEVEL` rename. R1 was broader than Ray's behavior: `ray.init()` does not record its cluster.
-- (h) The compatibility job left `torchaudio` to PyPI, which fails to load against CPU torch. Running the job's steps found this before it reached CI.
+- (h) **Every ComfyUI failure returned 500 and stranded async jobs in `processing`.** Serve pickles a deployment class when its decorator runs, so `_backend_http_exception`, defined below the classes, raised `NameError` in the replica. This is a pre-existing bug that sentimentizer still has. The M3 comparison missed it because the stand-in never failed a workflow; running against a real ComfyUI found it. Fixed in imagenate with a regression test, so failures now differ from sentimentizer by design: 502 instead of 500.
+- (i) The compatibility job left `torchaudio` to PyPI, which fails to load against CPU torch. Running the job's steps found this before it reached CI.
 
 ## Follow-up: drop Ray Serve
 
