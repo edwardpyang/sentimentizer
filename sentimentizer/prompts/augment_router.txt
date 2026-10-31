@@ -1,8 +1,10 @@
-Generate {num_variations} variations of this Yelp review: "{seed_text}"
+Task: {task_description}
+Label definitions: {label_descriptions}
+Generate {num_variations} variations of this input: "{seed_text}"
 
 The original is categorized as '{seed_category}'. Generate variations that:
 1. Stay in the '{seed_category}' category (at least 60%)
-2. Sound like they belong to '{other_category_1}' or '{other_category_2}' but are actually '{seed_category}' (hard negatives, at least 20%)
+2. Sound like they belong to a competing category from {other_categories} but are actually '{seed_category}' (hard negatives, at least 20%)
 
 Output as JSONL with fields: text, label (where label={seed_label})
 One JSON object per line.

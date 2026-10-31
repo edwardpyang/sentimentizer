@@ -1,11 +1,8 @@
-"""Router module for Yelp review categorization.
-
-Provides a 3-class routing classifier (Dietary, Service, General)
-trained via contrastive learning with sentence-transformers + sklearn.
-"""
+"""Provide reusable task classifiers with food-review defaults."""
 
 from sentimentizer.router.config import AugmentConfig, RouteLabels, RouterConfig, SetFitConfig
 from sentimentizer.router.model import RouterModel
+from sentimentizer.router.schemas import RouterClassification, RouterTaskSpec
 from sentimentizer.router.seeds import SEED_UTTERANCES
 
 __all__ = [
@@ -15,4 +12,6 @@ __all__ = [
     "SetFitConfig",
     "RouteLabels",
     "SEED_UTTERANCES",
+    "RouterClassification",
+    "RouterTaskSpec",
 ]

@@ -7,7 +7,7 @@ description: Use ONLY when the user asks to plan a new feature, refactor, or arc
 
 You are planning a non-trivial feature, architectural change, or refactor in
 this repository — a PyTorch sentiment-analysis pipeline with Ray Train, Ray
-Serve, an intent router, embeddings, diffusion, and metrics. Produce a reviewed,
+Serve, an intent router, embeddings, and metrics. Produce a reviewed,
 risk-adjusted plan before writing any code.
 
 > **Do not run `mdformat` on this file or any other `.skills/**/SKILL.md`.** It

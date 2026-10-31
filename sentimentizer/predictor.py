@@ -17,7 +17,7 @@ Usage::
     #  "token_count": 3, "model": "encoder", "positive": 0.88}, ...]
 
     route = predictor.classify("Is the pasta gluten-free?")
-    # {"text": "Is the pasta gluten-free?", "prediction": {"category": "dietary"}}
+    # {"prediction": {"label": "dietary", "score": 0.95, "token_count": 4}}
 
     tokens = predictor.tokenize("Hello world")
     # {"text": "Hello world", "tokens": ["hello", "world"], "token_ids": [...], "token_count": 2}
@@ -41,6 +41,8 @@ from sentimentizer.config import (
     auto_detect_device,
 )
 from sentimentizer.models.base import BaseSentimentModel, get_trained_model
+from sentimentizer.router.config import DEFAULT_ROUTER_MODEL_PATH, FOOD_TASK_SPEC
+from sentimentizer.router.model import RouterModel
 from sentimentizer.tokenizer import Tokenizer, get_trained_tokenizer, regex_tokenize, text_sequencer
 
 # ---------------------------------------------------------------------------
@@ -51,9 +53,6 @@ try:
     # router.config/model import lazily, so probe sentence_transformers
     # (the actual optional dep) here to set _ROUTER_AVAILABLE correctly.
     import sentence_transformers  # noqa: F401
-
-    from sentimentizer.router.config import RouteLabels
-    from sentimentizer.router.model import RouterModel
 
     _ROUTER_AVAILABLE = True
 except ImportError:
@@ -94,7 +93,7 @@ class SentimentPredictor:
 
         # --- Router model (lazy — loaded on first classify() call) ---
         if router_model_path is None:
-            router_model_path = "models/router"
+            router_model_path = DEFAULT_ROUTER_MODEL_PATH
         self._router_model_path: str = router_model_path
         self.router: Any = None
         self._router_error: str | None = None
@@ -134,7 +133,7 @@ class SentimentPredictor:
             return None, str(exc)
 
     def _load_router_model(self, router_model_path: str) -> tuple[Any, str | None]:
-        """Load the RouterModel, downloading from HF Hub if missing.
+        """Load the RouterModel; only the default food path can auto-download.
 
         Returns (None, error_message) on failure so callers can return 503
         instead of crashing the whole deployment.
@@ -146,7 +145,8 @@ class SentimentPredictor:
 
         path = Path(router_model_path)
         try:
-            if not path.exists():
+            is_default = path.resolve() == Path(DEFAULT_ROUTER_MODEL_PATH).resolve()
+            if not path.exists() and is_default:
                 logger.info(f"Router model not found at {path}, downloading from HF Hub...")
                 try:
                     from huggingface_hub import snapshot_download
@@ -164,6 +164,16 @@ class SentimentPredictor:
             if path.exists():
                 logger.info(f"Loading router model from {path}")
                 model = RouterModel.from_pretrained(str(path))
+                if is_default and model.task is None and not model.labels:
+                    # Only the known default food artifact can omit integer label metadata.
+                    classes = np.asarray(model.head.classes_)
+                    if (
+                        classes.ndim == 1
+                        and classes.dtype.kind in "iu"
+                        and sorted(classes.tolist()) == list(range(len(FOOD_TASK_SPEC.labels)))
+                    ):
+                        model = RouterModel(model.backbone, model.head, task=FOOD_TASK_SPEC)
+                model.class_labels()
             else:
                 msg = f"Router model path not found: {path}"
                 logger.warning(msg)
@@ -310,25 +320,14 @@ class SentimentPredictor:
         if not self.router_loaded:
             raise RuntimeError(f"Router model not loaded: {self._router_error}")
 
-        label_names = RouteLabels.label_names()
-        predictions = self.router.predict(texts)
-        probabilities = self.router.predict_proba(texts)
+        predictions = self.router.classify_batch(texts)
         results: list[dict[str, Any]] = []
-        for i, (text, pred) in enumerate(zip(texts, predictions, strict=False)):
-            if isinstance(pred, str):
-                category = pred
-                label_idx = (
-                    list(label_names.values()).index(pred) if pred in label_names.values() else 0
-                )
-            else:
-                label_idx = int(pred)
-                category = label_names.get(label_idx, str(pred))
+        for text, prediction in zip(texts, predictions, strict=True):
             token_count = len(regex_tokenize(text))
             results.append(
                 {
                     "prediction": {
-                        "label": category,
-                        "score": float(probabilities[i, label_idx]),
+                        **prediction.model_dump(mode="json"),
                         "token_count": token_count,
                     },
                 }
@@ -412,9 +411,34 @@ class SentimentPredictor:
         """Return metadata about the loaded router model."""
         info: dict[str, Any] = {
             "model_path": self._router_model_path,
-            "categories": RouteLabels.label_names() if _ROUTER_AVAILABLE else [],
+            "categories": [],
+            "task_id": None,
+            "taxonomy_version": None,
             "status": "loaded" if self.router_loaded else "not_loaded",
         }
+        task = None
+        if self.router_loaded:
+            task = self.router.task
+            info["categories"] = self.router.labels or self.router.class_labels()
+        else:
+            try:
+                metadata = RouterModel.read_metadata(self._router_model_path)
+                if metadata is not None:
+                    task = metadata.task
+                    info["categories"] = metadata.labels
+                elif (
+                    Path(self._router_model_path).resolve()
+                    == Path(DEFAULT_ROUTER_MODEL_PATH).resolve()
+                ):
+                    task = FOOD_TASK_SPEC
+            except (ValueError, OSError, KeyError):
+                info["error"] = "Router artifact metadata is invalid or unreadable"
+        if task is not None:
+            info.update(
+                categories=list(task.labels),
+                task_id=task.task_id,
+                taxonomy_version=task.taxonomy_version,
+            )
         if self._router_error:
             info["error"] = self._router_error
         return info

@@ -362,18 +362,20 @@ def router_train(
     config_path: str | None,
 ) -> None:
     """Train the router model."""
+    from dataclasses import replace
     from pathlib import Path
 
-    from sentimentizer.router.config import RouterConfig, load_router_config
+    from sentimentizer.router.config import load_router_config
     from sentimentizer.router.dataset import load_router_dataset
     from sentimentizer.router.train_router import train_router
 
     train_cfg, _ = load_router_config(config_path)
-    config = RouterConfig(
+    config = replace(
+        train_cfg,
         base_model=base_model or train_cfg.base_model,
         output_dir=Path(output_dir) if output_dir else train_cfg.output_dir,
     )
-    train_ds, eval_ds = load_router_dataset(data)
+    train_ds, eval_ds = load_router_dataset(data, seed=config.seed)
     train_router(config, train_ds, eval_ds)
 
 
@@ -431,11 +433,23 @@ def router_augment(
     already appear in the output file are skipped, and new entries are
     appended to the existing file.
     """
+    from pathlib import Path
+
     from sentimentizer.router.augment import augment_seeds
-    from sentimentizer.router.config import load_router_config
+    from sentimentizer.router.config import FOOD_TASK_SPEC, load_router_config
+    from sentimentizer.router.dataset import load_router_records
     from sentimentizer.router.seeds import SEED_UTTERANCES
 
-    _, augment_cfg = load_router_config(config_path)
+    train_cfg, augment_cfg = load_router_config(config_path)
+    if augment_cfg.seed_path:
+        seed_path = Path(augment_cfg.seed_path)
+        if config_path and not seed_path.is_absolute():
+            seed_path = Path(config_path).parent / seed_path
+        seeds = load_router_records(seed_path)
+    elif train_cfg.task == FOOD_TASK_SPEC:
+        seeds = SEED_UTTERANCES
+    else:
+        raise click.UsageError("Custom tasks require augmentation.seed_path")
     effective_model = model or augment_cfg.model
     effective_url = ollama_url or augment_cfg.ollama_url
     effective_variations = variations or augment_cfg.variations_per_seed
@@ -444,15 +458,16 @@ def router_augment(
     if resume:
         click.echo(f"Resuming augmentation to {effective_output}...")
     else:
-        click.echo(f"Augmenting {len(SEED_UTTERANCES)} seeds with model={effective_model}...")
+        click.echo(f"Augmenting {len(seeds)} seeds with model={effective_model}...")
     click.echo(f"Streaming output to {effective_output} (entries written as generated)")
     augmented = augment_seeds(
-        SEED_UTTERANCES,
+        seeds,
         model=effective_model,
         ollama_url=effective_url,
         variations_per_seed=effective_variations,
         output_path=effective_output,
         resume=resume,
+        task=train_cfg.task,
     )
     click.echo(f"Done: {len(augmented)} total utterances written to {effective_output}")
 
@@ -463,15 +478,26 @@ def router_augment(
 @click.pass_context
 def router_evaluate(ctx: click.Context, model_path: str, data: str | None) -> None:
     """Evaluate the router model."""
+    import json
+
     from sentimentizer.router.evaluate import evaluate_router
     from sentimentizer.router.model import RouterModel
 
     model = RouterModel.from_pretrained(model_path)
     if data:
-        from sentimentizer.router.dataset import load_router_dataset
+        from sentimentizer.router.dataset import load_router_records
 
-        _, eval_ds = load_router_dataset(data)
-        evaluate_router(model, eval_ds)
+        records = load_router_records(data)
+        eval_ds = {
+            "text": [row["text"] for row in records],
+            "label": [row["label"] for row in records],
+        }
+        report = evaluate_router(model, eval_ds)
+        click.echo(
+            json.dumps(
+                {**report, "similarity_matrix": report["similarity_matrix"].tolist()}, indent=2
+            )
+        )
     else:
         click.echo("No evaluation data provided. Use --data to specify a JSONL file.")
 

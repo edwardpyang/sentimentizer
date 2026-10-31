@@ -30,34 +30,7 @@ classify_batch_wait_s: 0.05   # Seconds to wait before processing a partial rout
 cors_origins:
   - "*"
 
-# Headless ComfyUI image generation — disabled by default. ComfyUI owns the
-# CUDA device; Ray only submits workflows over HTTP and reserves no GPU.
-krea_2_enabled: false
-# Required when enabling Krea 2. Confirm license eligibility before setting true.
-krea_2_license_accepted: false
-ideogram_4_enabled: false
-# Required when enabling Ideogram 4. Its checkpoint is non-commercial.
-ideogram_4_license_accepted: false
-comfyui_base_url: "http://127.0.0.1:8188"
-comfyui_timeout_s: 600
-comfyui_poll_interval_s: 0.25
-# Must match ComfyUI's --temp-directory path and be visible to this process.
-comfyui_temp_directory: ""
-# Krea 2 requires a fail-closed output moderation endpoint. It receives JSON
-# containing image_b64, mime_type, model, and user and must return {"safe": bool}.
-image_moderation_url: ""
-image_moderation_api_key: ""
-image_moderation_timeout_s: 10
-default_image_model: "krea_2"
 request_timeout_s: 600
-
-# Middleware for image routes
-api_keys: []
-rate_limit_per_min: 60
-rate_limit_burst: 10
-idempotency_ttl_s: 600
-job_ttl_s: 3600
-prompt_blocklist_path: ""
 
 # Optional embedding deployments. Keep disabled on sentiment-only pods.
 embeddings_enabled: false

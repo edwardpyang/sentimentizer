@@ -263,3 +263,16 @@ def test_server_settings_support_environment_overrides(tmp_path) -> None:
     assert serve_cfg.bge_m3_max_ongoing_requests == 32
     assert serve_cfg.bge_m3_num_cpus == 1.5
     assert serve_cfg.bge_m3_num_gpus == 0.5
+
+
+@pytest.mark.parametrize(
+    ("argv", "env"),
+    [(["--diffusion"], {}), ([], {"SENTIMENTIZER_DIFFUSION_ENABLED": "1"})],
+)
+def test_diffusion_flag_exits_with_pointer_to_imagenate(capsys, argv, env) -> None:
+    with patch.dict(os.environ, env):
+        args = build_parser().parse_args(argv)
+    with pytest.raises(SystemExit) as exc_info:
+        run(args)
+    assert exc_info.value.code == 2
+    assert "imagenate" in capsys.readouterr().err

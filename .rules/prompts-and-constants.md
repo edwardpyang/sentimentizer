@@ -27,8 +27,6 @@ This extends DRY to the model-inference and agent surface.
   AugmentConfig defaults.
 - **Agent constants**: `sentimentizer/agent/` — model names, prompt templates,
   search rate limits.
-- **Diffusion constants**: `sentimentizer/diffusion/comfyui.py` — workflow
-  names, resolution defaults.
 - **Serve config**: `sentimentizer/serve/config.py` — endpoint limits, CORS,
   body-size caps.
 

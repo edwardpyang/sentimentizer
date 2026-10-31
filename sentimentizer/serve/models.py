@@ -1,7 +1,8 @@
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from sentimentizer.router.schemas import RouterClassification
 from sentimentizer.serve.config import cfg
 
 
@@ -220,16 +221,20 @@ class ModelsResponse(BaseModel):
     }
 
 
-class RouterPrediction(BaseModel):
+class _RouterResponseModel(BaseModel):
+    """Reject unexpected fields in router response envelopes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RouterPrediction(RouterClassification):
     """Single router prediction.
 
     Note: omits model field since there is only one router model.
     See /v1/router/models for router model metadata.
     """
 
-    label: str = Field(..., description="Predicted route category")
-    score: float = Field(..., description="Confidence score for the predicted route")
-    token_count: int = Field(..., description="Number of tokens in the input text")
+    token_count: int = Field(strict=True, ge=0, description="Number of regex tokens in the input")
 
     model_config = {
         "json_schema_extra": {
@@ -244,11 +249,11 @@ class RouterPrediction(BaseModel):
     }
 
 
-class RouterPredictResponse(BaseModel):
+class RouterPredictResponse(_RouterResponseModel):
     """Response from /v1/router/predict."""
 
     prediction: RouterPrediction
-    latency_s: float
+    latency_s: float = Field(strict=True, ge=0, allow_inf_nan=False)
 
     model_config = {
         "json_schema_extra": {
@@ -266,18 +271,25 @@ class RouterPredictResponse(BaseModel):
     }
 
 
-class RouterBatchResultItem(BaseModel):
+class RouterBatchResultItem(_RouterResponseModel):
     """Single item in a router batch response."""
 
     prediction: RouterPrediction
 
 
-class RouterBatchResponse(BaseModel):
+class RouterBatchResponse(_RouterResponseModel):
     """Response from /v1/router/batch."""
 
     results: list[RouterBatchResultItem]
-    count: int
-    latency_s: float
+    count: int = Field(strict=True, ge=0)
+    latency_s: float = Field(strict=True, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _validate_count(self) -> Self:
+        """Require count to reflect every serialized result."""
+        if self.count != len(self.results):
+            raise ValueError("Router batch count must match results")
+        return self
 
     model_config = {
         "json_schema_extra": {
@@ -300,13 +312,15 @@ class RouterBatchResponse(BaseModel):
     }
 
 
-class RouterModelsResponse(BaseModel):
+class RouterModelsResponse(_RouterResponseModel):
     """Response from /v1/router/models."""
 
     model_path: str
     categories: list[str]
-    status: str
+    status: Literal["loaded", "not_loaded"]
     error: str | None = None
+    task_id: str | None = None
+    taxonomy_version: str | None = None
 
     model_config = {
         "json_schema_extra": {
@@ -330,13 +344,6 @@ class HealthLiveResponse(BaseModel):
     model_config = {"json_schema_extra": {"examples": [{"status": "live", "uptime_s": 123.4}]}}
 
 
-class ImageModelsStatus(BaseModel):
-    """Status of image models within health ready response."""
-
-    krea_2: Literal["enabled", "disabled"]
-    ideogram_4: Literal["enabled", "disabled"]
-
-
 class HealthReadyResponse(BaseModel):
     """Response from /health/ready."""
 
@@ -347,7 +354,6 @@ class HealthReadyResponse(BaseModel):
     model_loaded: str
     router_loaded: bool
     router_error: str | None = None
-    image_models: ImageModelsStatus | None = None
 
     model_config = {
         "json_schema_extra": {
@@ -360,10 +366,6 @@ class HealthReadyResponse(BaseModel):
                     "model_loaded": "encoder",
                     "router_loaded": True,
                     "router_error": None,
-                    "image_models": {
-                        "krea_2": "enabled",
-                        "ideogram_4": "disabled",
-                    },
                 }
             ]
         }

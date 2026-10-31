@@ -249,6 +249,40 @@ No. This project's ONNX export and quantization use `onnxruntime.quantization.qu
 
 ## Intent Router Issues
 
+### Router model metadata returns 500
+
+**Check**: Current code returns an ordered category list and validates the typed
+metadata response. Older releases returned a dictionary where the response
+schema required a list. Update stale service code if logs still identify that
+shape mismatch. See the [metadata contract](serving.md#router-model-metadata).
+
+Invalid or unreadable local metadata is reported in the response's `error`
+field without loading weights. Check `router_config.json` for duplicate labels,
+invalid JSON, or conflicts between `labels` and `task.labels`. Metadata uses
+`status: "not_loaded"` before first use and after a cached load failure; this
+status alone does not indicate an HTTP error.
+
+### Router label looks correct but its confidence does not
+
+**Check**: Current `RouterModel.classify_batch()` selects the winning probability
+column through `head.classes_` and the saved vocabulary. Earlier versions
+assumed numeric class IDs were column positions. Update stale callers that
+combine raw predict/predict_proba results using that assumption.
+
+The saved label order defines integer IDs and must match the fitted head.
+Inspect the artifact's `labels`/`task` metadata if an external producer assigned
+different meanings to those IDs; retrain or correct the artifact at its source.
+A schema can validate a numeric range but cannot prove an incorrectly labeled
+training dataset has the right semantics.
+
+### A custom model path fails instead of downloading
+
+Automatic Hub download is reserved for the default `models/router` food path.
+Set `ROUTER_MODEL_PATH` to an existing trained custom artifact directory. It
+must contain its backbone, classifier head, and label metadata. A missing
+custom path never downloads food weights into that directory. Loading failures
+are cached; recreate the predictor/service after correcting the path or artifact.
+
 ### Ollama API connection failure during augmentation
 
 **Symptoms**: `augment_seeds()` logs `Ollama API request failed` and returns only the original seeds.
@@ -368,7 +402,12 @@ docker compose up vectorizer
 
 **Root cause**: The `@serve.batch` decorator on `predict_sentiment()` collects requests over a `batch_wait_timeout_s` window (default 50ms). If the batch function raises an exception, individual callers hang because `@serve.batch` doesn't propagate errors back to all callers in all Ray versions.
 
-**Fix**: The batch function (`predict_sentiment`, `classify_route`) must always return a list with the same length as the `inputs` argument. Never let a batch function return fewer items than it received. Wrap inference in try/except and return error dicts if needed.
+**Check**: On a successful inference, the batch function (`predict_sentiment`,
+`classify_route`) must return a list with the same length as `inputs`. Inspect
+replica logs for inference exceptions and output-size mismatches. Error
+propagation depends on the installed Ray behavior; do not return ad hoc error
+dictionaries as router predictions, because they violate the declared success
+response schema.
 
 ### Ray Serve worker venv issues (uv)
 
@@ -388,9 +427,12 @@ And passes `runtime_env={"py_executable": sys.executable}` to `ray.init()`. This
 
 **Symptoms**: The `/v1/router/batch` endpoint returns fewer items than the number of input texts.
 
-**Root cause**: `RouterBatchResponse` includes `"count": len(results)` which should always equal `len(body.texts)`. If it doesn't, there's a bug in the batch handler or in `predictor.classify_batch()`.
-
-**Fix**: Verify that `classify_batch()` in the predictor always returns exactly one result per input text.
+**Check**: Current code rejects partial probability batches, validates the HTTP
+request/result count, and requires Pydantic count to equal results length. An
+invalid backend response is a server error, rather than a successful partial
+batch. If a successful response is short, check for an older deployment or a
+custom adapter bypassing these checks. Every input must have one result in the
+same order; do not pad a short response with fabricated predictions.
 
 ### CORS preflight fails with duplicate headers
 
@@ -399,6 +441,15 @@ And passes `runtime_env={"py_executable": sys.executable}` to `ray.init()`. This
 **Root cause**: Some Ray Serve versions add their own CORS headers. If the FastAPI `CORSMiddleware` is also adding CORS headers, you get duplicates.
 
 **Fix**: Check the raw response headers with `curl -v`. If duplicates appear, check the Ray Serve proxy configuration. In the current setup, this shouldn't happen because Ray's proxy doesn't add CORS headers by default.
+
+### Long-running Ray Serve dies when training starts
+
+Training's `_kill_stale_ray_processes` (`workflows/lifecycle.py`) runs `pkill` on
+every `raylet`, `gcs_server`, and `ray::IDLE` on the host when `ray.init` fails, and
+`_cleanup_stale_ray_sessions` deletes `/tmp/ray/session_*` directories older than an
+hour, which can include a live session. This affects any Ray service on the host,
+including sentiment Serve and imagenate. Run long-lived services in their own
+containers, or do not train on that host.
 
 ### Ray Train Worker Crashes
 

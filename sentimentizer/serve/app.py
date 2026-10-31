@@ -33,15 +33,6 @@ Endpoints:
     POST /v1/router/batch     -- Route multiple texts
     GET  /v1/router/models    -- Router model metadata
 
-  Image Generation (if enabled):
-    POST /v1/images/generate    -- Generate with Krea 2 or Ideogram 4
-    POST /v1/images/jobs        -- Create an async image generation job
-    GET  /v1/images/jobs        -- List image generation jobs
-    GET  /v1/images/jobs/{id}   -- Get job status/result
-    DELETE /v1/images/jobs/{id} -- Cancel a queued job
-    GET  /v1/images/models      -- Image model metadata
-    GET  /v1/images/models/{name} -- Single image model metadata
-
   Infrastructure (unversioned):
     GET  /health               -- Backward-compatible alias for /health/ready
     GET  /health/live          -- Liveness probe (always 200)
@@ -106,18 +97,12 @@ from sentimentizer.serve.models import (
     PredictRequest,
     PredictResponse,
     RouterBatchResponse,
+    RouterBatchResultItem,
     RouterModelsResponse,
     RouterPredictResponse,
     TokenizeRequest,
     TokenizeResponse,
 )
-
-# ---------------------------------------------------------------------------
-# Load configuration (YAML defaults < env var overrides)
-# ---------------------------------------------------------------------------
-
-if cfg.api_keys:
-    os.environ.setdefault("SENTIMENTIZER_API_KEYS", ",".join(cfg.api_keys))
 
 # ---------------------------------------------------------------------------
 # FastAPI app (module-level for @serve.ingress)
@@ -363,11 +348,7 @@ class SentimentizerDeployment:
     ``asyncio.to_thread()`` to avoid blocking the event loop.
     """
 
-    def __init__(
-        self,
-        embeddings_handle: Any | None = None,
-        image_model_names: list[str] | None = None,
-    ) -> None:
+    def __init__(self, embeddings_handle: Any | None = None) -> None:
         self._started_at = time.time()
         self._ready = False
         self._load_error: str | None = None
@@ -376,16 +357,6 @@ class SentimentizerDeployment:
         self._embedding_metrics = ServiceMetrics(prefix="embedding")
         self.predictor: SentimentPredictor | None = None
         self._embeddings_handle = embeddings_handle
-        self._image_model_names = image_model_names or []
-        self._comfyui_health_client: Any | None = None
-        if self._image_model_names:
-            from sentimentizer.diffusion.comfyui import ComfyUIClient
-
-            self._comfyui_health_client = ComfyUIClient(
-                cfg.comfyui_base_url,
-                timeout_s=min(cfg.comfyui_timeout_s, 10.0),
-                poll_interval_s=cfg.comfyui_poll_interval_s,
-            )
 
         try:
             self.predictor = SentimentPredictor(
@@ -676,13 +647,18 @@ class SentimentizerDeployment:
     # ------------------------------------------------------------------
 
     @app.post("/v1/router/predict", response_model=RouterPredictResponse)
-    async def router_predict(self, body: PredictRequest, request: Request) -> dict[str, Any]:
+    async def router_predict(self, body: PredictRequest, request: Request) -> RouterPredictResponse:
         """POST /v1/router/predict -- classify a single text (auto-batched)."""
         self._require_ready()
 
         start = time.perf_counter()
         try:
             raw_result = await self.classify_route({"text": body.text})
+            item = RouterBatchResultItem.model_validate(raw_result)
+            latency = time.perf_counter() - start
+            response = RouterPredictResponse(
+                prediction=item.prediction, latency_s=round(latency, 4)
+            )
         except Exception:
             latency = time.perf_counter() - start
             self._router_metrics.record_request(latency, error=True)
@@ -692,31 +668,31 @@ class SentimentizerDeployment:
                     detail=f"Router model not loaded: {self.predictor.router_error}",
                 ) from None
             raise
-        latency = time.perf_counter() - start
-
         self._router_metrics.record_request(latency)
-        prediction = raw_result.get("prediction", {})
         request_id = getattr(request.state, "request_id", "unknown")
         logger.info(
             "router prediction completed",
             request_id=request_id,
             input_length=len(body.text),
             latency_s=f"{latency:.4f}",
-            category=prediction.get("label", ""),
+            category=response.prediction.label,
         )
-        return {
-            "prediction": prediction,
-            "latency_s": round(latency, 4),
-        }
+        return response
 
     @app.post("/v1/router/batch", response_model=RouterBatchResponse)
-    async def router_batch(self, body: BatchRequest, request: Request) -> dict[str, Any]:
+    async def router_batch(self, body: BatchRequest, request: Request) -> RouterBatchResponse:
         """POST /v1/router/batch -- classify multiple texts into routes."""
         self._require_ready()
 
         start = time.perf_counter()
         try:
             results = await asyncio.to_thread(self.predictor.classify_batch, body.texts)
+            if len(results) != len(body.texts):
+                raise ValueError("Router batch results must match the number of input texts")
+            latency = time.perf_counter() - start
+            response = RouterBatchResponse(
+                results=results, count=len(results), latency_s=round(latency, 4)
+            )
         except Exception:
             latency = time.perf_counter() - start
             self._router_metrics.record_request(latency, error=True)
@@ -726,8 +702,6 @@ class SentimentizerDeployment:
                     detail=f"Router model not loaded: {self.predictor.router_error}",
                 ) from None
             raise
-        latency = time.perf_counter() - start
-
         self._router_metrics.record_request(latency)
         request_id = getattr(request.state, "request_id", "unknown")
         logger.info(
@@ -736,17 +710,13 @@ class SentimentizerDeployment:
             batch_size=len(body.texts),
             latency_s=f"{latency:.4f}",
         )
-        return {
-            "results": results,
-            "count": len(results),
-            "latency_s": round(latency, 4),
-        }
+        return response
 
     @app.get("/v1/router/models", response_model=RouterModelsResponse)
-    async def router_models(self) -> dict[str, Any]:
+    async def router_models(self) -> RouterModelsResponse:
         """GET /v1/router/models -- router model metadata."""
         self._require_ready()
-        return self.predictor.get_router_model_info()
+        return RouterModelsResponse.model_validate(self.predictor.get_router_model_info())
 
     # ------------------------------------------------------------------
     # Infrastructure handlers (unversioned)
@@ -807,19 +777,9 @@ class SentimentizerDeployment:
             "router_loaded": self.predictor.router_loaded,
             "router_error": self.predictor.router_error,
         }
-        image_backend_ready = True
-        if self._image_model_names:
-            try:
-                await asyncio.to_thread(self._comfyui_health_client.system_stats)
-                body["image_models"] = {name: "ready" for name in self._image_model_names}
-            except Exception:
-                image_backend_ready = False
-                body["status"] = "not_ready"
-                body["image_models"] = {name: "unavailable" for name in self._image_model_names}
-                body["image_backend_error"] = "ComfyUI sidecar unavailable"
         body["embeddings_enabled"] = cfg.embeddings_enabled
         body["bge_m3_enabled"] = cfg.bge_m3_enabled
-        if not self.predictor.model_loaded or not image_backend_ready:
+        if not self.predictor.model_loaded:
             return JSONResponse(status_code=503, content=body)
         return body
 
@@ -829,17 +789,12 @@ class SentimentizerDeployment:
         return await self.health_ready()
 
 
-def main(host: str | None = None, port: int | None = None, diffusion: bool = False) -> None:
+def main(host: str | None = None, port: int | None = None) -> None:
     """Start the Sentimentizer Serve application programmatically.
 
     Args:
         host: Bind address. Defaults to ``serve_host`` from ``service.yaml``.
         port: Bind port. Defaults to ``serve_port`` from ``service.yaml``.
-        diffusion: If True, start the image generation (diffusion) deployment
-            alongside sentiment. This requires GPU hardware and model weights.
-            When False (default), only sentiment + router endpoints are served.
-            ComfyUI runs as a separate headless process and owns the GPU.
-            Enable Krea 2 or Ideogram 4 in ``service.yaml`` or with env vars.
 
     Workers use the current Python executable directly (no isolated venv),
     which avoids the ``ModuleNotFoundError: No module named 'ray'`` issue
@@ -873,19 +828,6 @@ def main(host: str | None = None, port: int | None = None, diffusion: bool = Fal
         )
     )
 
-    start_diffusion = diffusion or cfg.krea_2_enabled or cfg.ideogram_4_enabled
-    model_names: list[str] = []
-    if cfg.krea_2_enabled:
-        model_names.append("krea_2")
-    if cfg.ideogram_4_enabled:
-        model_names.append("ideogram_4")
-    if start_diffusion and not model_names:
-        raise ValueError(
-            "--diffusion requires an explicitly enabled image model. Set "
-            "SENTIMENTIZER_KREA_2_ENABLED=true or SENTIMENTIZER_IDEOGRAM_4_ENABLED=true "
-            "and satisfy that model's license requirements."
-        )
-
     embeddings_handle = None
     if cfg.embeddings_enabled:
         from sentimentizer.serve.embeddings_app import EmbeddingsDeployment
@@ -893,28 +835,10 @@ def main(host: str | None = None, port: int | None = None, diffusion: bool = Fal
         embeddings_handle = EmbeddingsDeployment.bind()
 
     serve.run(
-        SentimentizerDeployment.bind(embeddings_handle, model_names),
+        SentimentizerDeployment.bind(embeddings_handle),
         name="sentimentizer",
         route_prefix="/",
     )
-
-    if start_diffusion:
-        from sentimentizer.diffusion.job_store import JobStore
-        from sentimentizer.serve.diffusion_app import ComfyUIDeployment, ImagesDispatcher
-
-        JobStore.options(
-            name="diffusion_job_store",
-            lifetime="detached",
-            get_if_exists=True,
-        ).remote(ttl_s=cfg.job_ttl_s)
-
-        comfyui_handle = ComfyUIDeployment.bind(model_names)
-
-        serve.run(
-            ImagesDispatcher.bind(comfyui_handle, model_names),
-            name="images",
-            route_prefix="/v1/images",
-        )
 
     import signal
 

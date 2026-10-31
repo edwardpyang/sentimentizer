@@ -4,6 +4,17 @@
 
 # Training configuration (sentence-transformers + sklearn)
 training:
+  task:
+    task_id: food_reviews
+    taxonomy_version: "1"
+    description: Classify restaurant reviews by topic.
+    labels: [dietary, service, general]
+    label_descriptions:
+      dietary: Allergies, dietary restrictions, and ingredient suitability.
+      service: Staff, waiting, reservations, and service experience.
+      general: Food quality, ambiance, price, and other review topics.
+    fallback_label: general
+    input_format: text-v1
   base_model: "BAAI/bge-base-en-v1.5"  # BGE-Base: 109M params, 768-dim, strong MTEB scores
   num_iterations: 20               # Contrastive pairs per example
   num_epochs: 1                     # Fine-tuning epochs
@@ -14,6 +25,7 @@ training:
 
 # Augmentation configuration (GLM 5.1 via Ollama)
 augmentation:
+  seed_path: ""                    # Empty uses the bundled food-review seeds
   model: "glm-5.1:cloud"                          # Ollama model name
   ollama_url: "http://localhost:11434/api/generate" # Ollama API endpoint
   variations_per_seed: 50                          # Variations per seed utterance

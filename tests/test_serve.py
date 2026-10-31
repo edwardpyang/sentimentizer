@@ -15,7 +15,7 @@ mock ``self`` that mirrors the deployment's runtime attributes.
 import asyncio
 import inspect
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
@@ -30,6 +30,33 @@ from sentimentizer.serve.base import ServiceMetrics
 from sentimentizer.serve.models import PredictRequest
 
 _SentimentizerDeployment = _Deployment.func_or_class
+
+
+def _router_client(dep):
+    """Exercise real handlers and response serialization without a Ray cluster."""
+    from sentimentizer.serve.app import create_fastapi_app
+    from sentimentizer.serve.models import (
+        BatchRequest,
+        RouterBatchResponse,
+        RouterModelsResponse,
+        RouterPredictResponse,
+    )
+
+    api = create_fastapi_app("Router contract test", "Router contract test")
+
+    @api.post("/v1/router/predict", response_model=RouterPredictResponse)
+    async def single(body: PredictRequest, request: Request):
+        return await _SentimentizerDeployment.router_predict(dep, body, request)
+
+    @api.post("/v1/router/batch", response_model=RouterBatchResponse)
+    async def batch(body: BatchRequest, request: Request):
+        return await _SentimentizerDeployment.router_batch(dep, body, request)
+
+    @api.get("/v1/router/models", response_model=RouterModelsResponse)
+    async def models():
+        return await _SentimentizerDeployment.router_models(dep)
+
+    return TestClient(api, raise_server_exceptions=False)
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +119,6 @@ def _mock_deployment(predictor=None, ready=True, load_error=None):
     dep._sentiment_metrics = ServiceMetrics(prefix="sentimentizer")
     dep._router_metrics = ServiceMetrics(prefix="router")
     dep._embedding_metrics = ServiceMetrics(prefix="embedding")
-    dep._image_model_names = []
-    dep._comfyui_health_client = None
     dep.predictor = predictor or _mock_predictor()
     dep._require_ready = lambda: _SentimentizerDeployment._require_ready(dep)
 
@@ -273,34 +298,6 @@ class TestPydanticValidation:
         assert any("texts" in str(e.get("loc", [])) for e in errors)
 
 
-class TestGenerateRequestValidation:
-    def test_reference_images_empty_list_coerced_to_none(self) -> None:
-        from sentimentizer.serve.diffusion_models import GenerateRequest
-
-        req = GenerateRequest(prompt="test", reference_images=[])
-        assert req.reference_images is None
-
-    def test_reference_images_valid(self) -> None:
-        from sentimentizer.serve.diffusion_models import GenerateRequest
-
-        req = GenerateRequest(prompt="test", reference_images=["b64_1", "b64_2"])
-        assert req.reference_images == ["b64_1", "b64_2"]
-
-    def test_reference_images_too_many(self) -> None:
-        from sentimentizer.serve.diffusion_models import GenerateRequest
-
-        with pytest.raises(ValidationError) as exc_info:
-            GenerateRequest(prompt="test", reference_images=["b64_1", "b64_2", "b64_3"])
-        assert any(e["type"] == "value_error" for e in exc_info.value.errors())
-
-    def test_reference_images_empty_string(self) -> None:
-        from sentimentizer.serve.diffusion_models import GenerateRequest
-
-        with pytest.raises(ValidationError) as exc_info:
-            GenerateRequest(prompt="test", reference_images=[""])
-        assert any(e["type"] == "value_error" for e in exc_info.value.errors())
-
-
 # ---------------------------------------------------------------------------
 # Test: Prediction response schema (P1#5 additive format)
 # ---------------------------------------------------------------------------
@@ -355,17 +352,10 @@ class TestReadinessEndpoint:
         assert isinstance(result, JSONResponse)
         assert result.status_code == 503
 
-    def test_health_ready_returns_503_when_comfyui_is_unavailable(self):
-        dep = _mock_deployment()
-        dep._image_model_names = ["krea_2"]
-        dep._comfyui_health_client = MagicMock()
-        dep._comfyui_health_client.system_stats.side_effect = RuntimeError("connection refused")
-
-        result = _run(_SentimentizerDeployment.health_ready(dep))
-
-        assert isinstance(result, JSONResponse)
-        assert result.status_code == 503
-        assert b'"krea_2":"unavailable"' in result.body
+    def test_health_ready_has_no_image_keys(self):
+        result = _run(_SentimentizerDeployment.health_ready(_mock_deployment()))
+        assert "image_models" not in result
+        assert "image_backend_error" not in result
 
 
 class TestHealthBackwardCompat:
@@ -1039,63 +1029,219 @@ class TestCORSMiddleware:
 
 
 # ---------------------------------------------------------------------------
-# Test: Rate Limiter and Auth (H3 and M8)
+# Test: Image settings moved to the imagenate service
 # ---------------------------------------------------------------------------
 
 
-class TestRateLimiterAndAuth:
-    """Test API key authentication and rate limiting behavior."""
+class TestRemovedImageSettings:
+    def test_removed_env_var_warns_and_is_ignored(self, monkeypatch):
+        from sentimentizer.serve import config as config_module
 
-    def test_require_api_key_valid(self):
-        import os
+        monkeypatch.setenv("SENTIMENTIZER_KREA_2_ENABLED", "true")
+        with patch.object(config_module, "logger") as logger:
+            loaded = config_module.load_serve_config()
+        logger.warning.assert_called_once_with(
+            "image_setting_ignored_moved_to_imagenate", env_var="SENTIMENTIZER_KREA_2_ENABLED"
+        )
+        assert not hasattr(loaded, "krea_2_enabled")
 
-        # Force reloading valid keys
-        import sentimentizer.serve.middleware as middleware
-        from sentimentizer.serve.middleware import require_api_key
+    def test_per_model_diffusion_env_var_warns(self, monkeypatch):
+        from sentimentizer.serve import config as config_module
 
-        middleware._valid_keys_cache = None
+        monkeypatch.setenv("SENTIMENTIZER_DIFFUSION_KREA_2_DEFAULT_STEPS", "4")
+        with patch.object(config_module, "logger") as logger:
+            config_module.load_serve_config()
+        logger.warning.assert_called_once()
 
-        os.environ["SENTIMENTIZER_API_KEYS"] = "test-key-1,test-key-2"
-        try:
-            assert require_api_key("Bearer test-key-1") == "test-key-1"
-        finally:
-            del os.environ["SENTIMENTIZER_API_KEYS"]
-            middleware._valid_keys_cache = None
+    def test_stale_yaml_key_warns_instead_of_failing_startup(self, tmp_path):
+        from sentimentizer.serve import config as config_module
 
-    def test_require_api_key_invalid(self):
-        import os
+        path = tmp_path / "service.yaml"
+        path.write_text("api_keys: [secret-value]\nserve_port: 9000\n")
+        with patch.object(config_module, "logger") as logger:
+            loaded = config_module.load_serve_config(path)
+        assert loaded.serve_port == 9000
+        logger.warning.assert_called_once_with(
+            "image_setting_ignored_moved_to_imagenate", yaml_key="api_keys"
+        )
+        assert "secret-value" not in str(logger.warning.call_args)
 
-        import sentimentizer.serve.middleware as middleware
-        from sentimentizer.serve.middleware import require_api_key
+    def test_clean_config_does_not_warn(self):
+        from sentimentizer.serve import config as config_module
 
-        middleware._valid_keys_cache = None
+        with patch.object(config_module, "logger") as logger:
+            config_module.load_serve_config()
+        logger.warning.assert_not_called()
 
-        os.environ["SENTIMENTIZER_API_KEYS"] = "test-key-1"
-        try:
-            with pytest.raises(HTTPException) as exc_info:
-                require_api_key("Bearer wrong-key")
-            assert exc_info.value.status_code == 401
-            assert exc_info.value.detail["code"] == "invalid_api_key"
-        finally:
-            del os.environ["SENTIMENTIZER_API_KEYS"]
-            middleware._valid_keys_cache = None
 
-    def test_get_limiter_respects_config(self):
-        import os
+# ---------------------------------------------------------------------------
+# Test: Request body size limits
+# ---------------------------------------------------------------------------
 
-        import sentimentizer.serve.middleware as middleware
-        from sentimentizer.serve.middleware import _get_limiter
 
-        # Reset global limiter
-        middleware._limiter = None
+class TestRequestBodySizeLimitMiddleware:
+    def _make_app(self) -> FastAPI:
 
-        os.environ["SENTIMENTIZER_RATE_LIMIT_PER_MIN"] = "99"
-        os.environ["SENTIMENTIZER_RATE_LIMIT_BURST"] = "5"
-        try:
-            limiter = _get_limiter()
-            assert limiter._rpm == 99
-            assert limiter._burst == 5
-        finally:
-            del os.environ["SENTIMENTIZER_RATE_LIMIT_PER_MIN"]
-            del os.environ["SENTIMENTIZER_RATE_LIMIT_BURST"]
-            middleware._limiter = None
+        from sentimentizer.serve.app import _RequestBodySizeLimitMiddleware
+
+        app = FastAPI()
+        app.add_middleware(
+            _RequestBodySizeLimitMiddleware,
+            default_max_bytes=100,
+            path_limits={"/v1/images/": 200},
+        )
+
+        @app.post("/normal")
+        async def normal(request: Request):
+            body = await request.body()
+            return {"size": len(body)}
+
+        @app.post("/v1/images/generate")
+        async def images(request: Request):
+            body = await request.body()
+            return {"size": len(body)}
+
+        return app
+
+    def test_normal_route_under_limit(self) -> None:
+        client = TestClient(self._make_app())
+        resp = client.post("/normal", content=b"a" * 99)
+        assert resp.status_code == 200
+
+    def test_normal_route_over_limit(self) -> None:
+        client = TestClient(self._make_app())
+        resp = client.post("/normal", content=b"a" * 101)
+        assert resp.status_code == 413
+        assert resp.json()["error"]["code"] == "request_too_large"
+
+    def test_image_route_under_limit(self) -> None:
+        client = TestClient(self._make_app())
+        resp = client.post("/v1/images/generate", content=b"a" * 199)
+        assert resp.status_code == 200
+
+    def test_image_route_over_limit(self) -> None:
+        client = TestClient(self._make_app())
+        resp = client.post("/v1/images/generate", content=b"a" * 201)
+        assert resp.status_code == 413
+        assert resp.json()["error"]["code"] == "request_too_large"
+
+
+class TestGenericRouterHTTP:
+    def test_custom_labels_preserve_single_and_batch_envelopes(self):
+        predictor = _mock_predictor()
+        predictor.classify_batch.side_effect = lambda texts: [
+            {"prediction": {"label": text, "score": 0.9, "token_count": 1}} for text in texts
+        ]
+        dep = _mock_deployment(predictor)
+        with _router_client(dep) as client:
+            single = client.post("/v1/router/predict", json={"text": "custom_a"})
+            assert single.status_code == 200
+            assert single.headers["content-type"] == "application/json"
+            assert single.json()["prediction"] == {
+                "label": "custom_a",
+                "score": 0.9,
+                "token_count": 1,
+            }
+            batch = client.post("/v1/router/batch", json={"texts": ["custom_a", "custom_b"]})
+            assert batch.status_code == 200
+            assert batch.json()["count"] == 2
+            assert [row["prediction"]["label"] for row in batch.json()["results"]] == [
+                "custom_a",
+                "custom_b",
+            ]
+            assert batch.json()["results"][0]["prediction"] == single.json()["prediction"]
+        assert dep._router_metrics.error_count == 0
+        assert dep._router_metrics.request_count == 2
+
+    @pytest.mark.parametrize(
+        "bad_prediction",
+        [
+            {},
+            {"label": "a", "score": float("nan"), "token_count": 0},
+            {"label": "a", "score": "0.9", "token_count": 0},
+            {"label": "a", "score": 1.1, "token_count": 0},
+            {"label": "a", "score": 0.9, "token_count": True},
+            {"label": "a", "score": 0.9, "token_count": -1},
+            {"label": "a", "score": 0.9, "token_count": 1, "unexpected": 1},
+        ],
+    )
+    def test_bad_backend_output_is_500_and_counts_as_error(self, bad_prediction):
+        dep = _mock_deployment(
+            _mock_predictor(
+                classify_batch=MagicMock(
+                    return_value=[{"prediction": bad_prediction}],
+                )
+            )
+        )
+        with _router_client(dep) as client:
+            response = client.post("/v1/router/predict", json={"text": "example"})
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "internal_error"
+        assert response.json()["error"]["request_id"]
+        assert dep._router_metrics.error_count == 1
+        assert dep._router_metrics.request_count == 1
+
+    def test_partial_batch_is_not_returned_as_success(self):
+        dep = _mock_deployment()
+        with _router_client(dep) as client:
+            response = client.post("/v1/router/batch", json={"texts": ["a", "b"]})
+        assert response.status_code == 500
+        assert dep._router_metrics.error_count == 1
+
+    def test_real_metadata_producer_matches_json_contract_without_loading(self, tmp_path):
+        from sentimentizer.predictor import SentimentPredictor
+        from sentimentizer.router.schemas import RouterArtifactMetadata, RouterTaskSpec
+
+        task = RouterTaskSpec(task_id="test", labels=("a", "b"))
+        (tmp_path / "router_config.json").write_text(
+            RouterArtifactMetadata(task=task).model_dump_json()
+        )
+        predictor = SentimentPredictor.__new__(SentimentPredictor)
+        predictor._router_model_path = str(tmp_path)
+        predictor.router = None
+        predictor._router_error = None
+        predictor._load_router_model = MagicMock()
+        dep = _mock_deployment(predictor)
+        with _router_client(dep) as client:
+            response = client.get("/v1/router/models")
+        assert response.status_code == 200
+        assert response.json() == {
+            "model_path": str(tmp_path),
+            "categories": ["a", "b"],
+            "task_id": "test",
+            "taxonomy_version": "1",
+            "status": "not_loaded",
+            "error": None,
+        }
+        predictor._load_router_model.assert_not_called()
+
+    def test_load_failure_stays_503_and_requests_stay_422(self):
+        dep = _mock_deployment(_mock_predictor(router_loaded=False, router_error="missing model"))
+        with _router_client(dep) as client:
+            response = client.post("/v1/router/predict", json={"text": "example"})
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "service_unavailable"
+            response = client.post("/v1/router/batch", json={"texts": []})
+            assert response.status_code == 422
+            assert "detail" in response.json()
+
+    def test_openapi_is_static_and_generic_with_numeric_bounds(self):
+        with _router_client(_mock_deployment()) as client:
+            schemas = client.get("/openapi.json").json()["components"]["schemas"]
+        prediction = schemas["RouterPrediction"]
+        assert prediction["additionalProperties"] is False
+        assert "enum" not in prediction["properties"]["label"]
+        assert prediction["properties"]["score"]["minimum"] == 0
+        assert prediction["properties"]["score"]["maximum"] == 1
+        assert prediction["properties"]["token_count"]["minimum"] == 0
+        assert schemas["RouterPredictResponse"]["properties"]["latency_s"]["minimum"] == 0
+        assert schemas["RouterBatchResponse"]["properties"]["count"]["minimum"] == 0
+
+    def test_batch_schema_enforces_count_and_zero_tokens_remain_valid(self):
+        from sentimentizer.serve.models import RouterBatchResponse
+
+        item = {"prediction": {"label": "custom", "score": 1.0, "token_count": 0}}
+        assert RouterBatchResponse(results=[item], count=1, latency_s=0.0).count == 1
+        for count in [0, True, "1", -1]:
+            with pytest.raises(ValidationError):
+                RouterBatchResponse(results=[item], count=count, latency_s=0.0)

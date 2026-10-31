@@ -45,7 +45,7 @@ jobs:
         enable-cache: true
 
     - name: install dependencies
-      run: uv sync --extra dev,diffusion,ray,onnx,router
+      run: uv sync --extra dev,ray,onnx,router
 
     - name: ruff lint
       run: uv run ruff check .
@@ -89,7 +89,7 @@ jobs:
         enable-cache: true
 
     - name: install dependencies
-      run: uv sync --extra dev,diffusion,ray,onnx,router
+      run: uv sync --extra dev,ray,onnx,router
 
     - name: install pandas 2.2.3 over the lockfile
       run: |

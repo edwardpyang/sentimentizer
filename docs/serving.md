@@ -12,7 +12,7 @@ This document describes how to deploy and interact with the unified Sentimentize
 > uv add "sentimentizer[ray]"
 > ```
 
-The `serve` command starts a Ray Serve application with FastAPI routing (featuring interactive Swagger docs at `/docs`). It loads the sentiment model (defaulting to the configuration in `service.yaml`) and the intent router at startup. Headless Krea 2 and Ideogram 4 generation can be enabled through a separate ComfyUI process. All public APIs share the Ray Serve port.
+The `serve` command starts a Ray Serve application with FastAPI routing (featuring interactive Swagger docs at `/docs`). It loads the sentiment model (defaulting to the configuration in `service.yaml`) at startup. The intent router loads lazily on the first classification request; metadata requests do not trigger loading. All public APIs share the Ray Serve port.
 
 ### Starting the Server
 
@@ -77,8 +77,8 @@ Both the full and BGE-M3-only applications expose `/health/live`,
 > | `GET /v1/models` | `GET /v1/sentiment/models` |
 > | `GET /v1/models/{model_name}` | `GET /v1/sentiment/models/{model_name}` |
 >
-> Router (`/v1/router/…`), embeddings (`/v1/embeddings`, `/v1/embeddings/dense`),
-> and images (`/v1/images/…`) are already namespaced and have no deprecated form.
+> Router (`/v1/router/…`) and embeddings (`/v1/embeddings`, `/v1/embeddings/dense`)
+> are already namespaced and have no deprecated form.
 
 ### Sentiment Analysis Endpoints
 
@@ -191,7 +191,36 @@ Both the full and BGE-M3-only applications expose `/health/live`,
 
 ### Router (Review Categorization) Endpoints
 
+The router uses a SentenceTransformer backbone and LogisticRegression head.
+Its default categories are `dietary`, `service`, and `general`; custom artifacts
+provide their own vocabulary. Each route
+declares a Pydantic response model from `sentimentizer/serve/models.py`;
+FastAPI serializes responses as JSON objects. Example scores and timings below
+are illustrative.
+
+| Field | Meaning |
+| --- | --- |
+| `prediction.label` | Predicted route category; route categories are separate from sentiment labels. |
+| `prediction.score` | Finite probability assigned to the predicted category, between 0 and 1. |
+| `prediction.token_count` | Number of tokens from `regex_tokenize(text)`, rather than backbone subword tokens; can be zero. |
+| `latency_s` | Server-side handler duration in seconds, rounded to four decimal places; excludes client/network time. |
+| `results` | Batch prediction envelopes in input order, with exactly one result per input. |
+| `count` | Number of entries in `results`. |
+
+Prediction objects contain `label`, `score`, and `token_count`. They omit the
+input text, a `category` alias, the model name, and all-class probabilities.
+
+Handlers return Pydantic objects, with strict nonnegative integer counts,
+finite nonnegative latency, and no unexpected response fields. The shared
+classification schema lives in `router/schemas.py`; HTTP envelopes live in
+`serve/models.py`. Inference validates label membership against the loaded
+artifact's vocabulary, maps probabilities through `head.classes_`, and rejects
+malformed or partial batches. Validation occurs before success accounting.
+OpenAPI keeps the label type generic; use `/v1/router/models` to discover the
+loaded vocabulary. See [task configuration](router.md#reuse-with-external-configurations).
+
 #### Classify Single Review
+
 - **Route**: `POST /v1/router/predict`
 - **Request Body**:
   ```json
@@ -205,7 +234,7 @@ Both the full and BGE-M3-only applications expose `/health/live`,
     -H "Content-Type: application/json" \
     -d '{"text": "They were so careful with my celiac needs"}'
   ```
-- **Response**:
+- **Response** (`RouterPredictResponse`):
   ```json
   {
     "prediction": {
@@ -218,6 +247,7 @@ Both the full and BGE-M3-only applications expose `/health/live`,
   ```
 
 #### Classify Batch of Reviews
+
 - **Route**: `POST /v1/router/batch`
 - **Request Body**:
   ```json
@@ -231,161 +261,86 @@ Both the full and BGE-M3-only applications expose `/health/live`,
     -H "Content-Type: application/json" \
     -d '{"texts": ["Great gluten-free options!", "The waiter was rude", "Decent pizza"]}'
   ```
+- **Response** (`RouterBatchResponse`):
+  ```json
+  {
+    "results": [
+      {
+        "prediction": {
+          "label": "dietary",
+          "score": 0.95,
+          "token_count": 3
+        }
+      },
+      {
+        "prediction": {
+          "label": "service",
+          "score": 0.89,
+          "token_count": 4
+        }
+      },
+      {
+        "prediction": {
+          "label": "general",
+          "score": 0.91,
+          "token_count": 2
+        }
+      }
+    ],
+    "count": 3,
+    "latency_s": 0.0052
+  }
+  ```
 
 #### Router Model Metadata
+
 - **Route**: `GET /v1/router/models`
 - **Command**:
   ```bash
   curl http://localhost:8000/v1/router/models
   ```
+- **Declared response contract** (`RouterModelsResponse`):
+  ```json
+  {
+    "model_path": "models/router",
+    "categories": ["dietary", "service", "general"],
+    "status": "loaded",
+    "error": null,
+    "task_id": "food_reviews",
+    "taxonomy_version": "1"
+  }
+  ```
+
+`status` is currently produced as `loaded` or `not_loaded`. Before the first
+classification, it is `not_loaded` with no load error. A failed load is cached:
+status remains `not_loaded` and `error` contains the failure message. Metadata
+reads the local sidecar without loading or downloading weights. The example
+above describes a newly trained food artifact. Legacy artifacts may have null
+task/version fields. Unknown custom artifacts report empty categories and null
+task/version; the default food path can identify its food task before loading.
+Missing optional inference dependencies do not prevent local metadata inspection.
+The response model defaults `error` to `null` when the producer omits it.
+
+#### Router Errors
+
+Invalid request bodies retain Pydantic's HTTP 422 response shape. A failed
+router load during classification returns HTTP 503 through the standard
+`{"error": {"code": "service_unavailable", "message": "..."}}` envelope.
+Unhandled server failures return HTTP 500 with `code: "internal_error"` and a
+`request_id` inside `error`. Response validation failures are server errors;
+they are separate from request validation. Missing custom model paths never
+download the default food model. Correct the artifact or config and recreate
+the predictor/service to retry a cached loading failure.
 
 ---
 
-### Image Generation Endpoints
+### Image Generation
 
-> [!NOTE]
-> Torch Sentiment requires the `ray` and `diffusion` extras. ComfyUI runs in a
-> separate environment, owns the CUDA GPU, and must be started first.
-> ```bash
-> uv sync --extra ray --extra diffusion
-> ```
-
-The Ray deployment reserves no GPU and serializes submissions to the ComfyUI
-queue. Startup validates the native node types and checkpoint filenames before
-exposing the image service. No ComfyUI custom nodes are required.
-
-#### Headless ComfyUI setup
-
-Use a dedicated checkout and virtual environment. The pinned revision below is
-known to contain native ConvRot, Krea 2, and Ideogram 4 support:
-
-```bash
-git clone https://github.com/Comfy-Org/ComfyUI.git ../ComfyUI
-cd ../ComfyUI
-git checkout feca51a
-uv venv
-uv pip install -r requirements.txt
-```
-
-Download the official checkpoints into their corresponding directories:
-
-```bash
-curl -L -o models/diffusion_models/krea2_turbo_int8_convrot.safetensors \
-  https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_int8_convrot.safetensors
-curl -L -o models/text_encoders/qwen3vl_4b_fp8_scaled.safetensors \
-  https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors
-curl -L -o models/vae/qwen_image_vae.safetensors \
-  https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors
-
-curl -L -o models/diffusion_models/ideogram4_int8_convrot.safetensors \
-  https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/diffusion_models/ideogram4_int8_convrot.safetensors
-curl -L -o models/diffusion_models/ideogram4_unconditional_int8_convrot.safetensors \
-  https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/diffusion_models/ideogram4_unconditional_int8_convrot.safetensors
-curl -L -o models/text_encoders/qwen3vl_8b_fp8_scaled.safetensors \
-  https://huggingface.co/Comfy-Org/Qwen3-VL/resolve/main/text_encoders/qwen3vl_8b_fp8_scaled.safetensors
-curl -L -o models/vae/flux2-vae.safetensors \
-  https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors
-```
-
-Review the checkpoint licenses before downloading. Ideogram 4 is
-non-commercial and requires an explicit operator acknowledgement. Krea 2 uses
-the [Krea 2 Community License](https://www.krea.ai/krea-2-licensing); enabling
-it requires explicit license acceptance and a fail-closed output moderation
-endpoint. Start ComfyUI on loopback so its unauthenticated API is not publicly
-exposed:
-
-```bash
-uv run python main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch \
-  --temp-directory /tmp/sentimentizer-comfyui
-```
-
-Then configure and start Torch Sentiment:
-
-```bash
-export SENTIMENTIZER_KREA_2_ENABLED=true
-export SENTIMENTIZER_KREA_2_LICENSE_ACCEPTED=true
-export SENTIMENTIZER_IDEOGRAM_4_ENABLED=true
-export SENTIMENTIZER_IDEOGRAM_4_LICENSE_ACCEPTED=true
-export SENTIMENTIZER_IMAGE_MODERATION_URL=http://127.0.0.1:8090/v1/moderate-image
-export SENTIMENTIZER_IMAGE_MODERATION_API_KEY=replace-me
-export SENTIMENTIZER_COMFYUI_BASE_URL=http://127.0.0.1:8188
-export SENTIMENTIZER_COMFYUI_TEMP_DIRECTORY=/tmp/sentimentizer-comfyui/temp
-export SENTIMENTIZER_API_KEYS=test-key-123
-python -m sentimentizer.serve
-```
-
-The moderation endpoint receives JSON containing `image_b64`, `mime_type`,
-`model`, and `user`. It must explicitly return `{"safe": true}` before Torch
-Sentiment releases an image. It may reject output with `{"safe": false,
-"code": "...", "message": "..."}`. Timeouts, connection failures, and malformed
-responses fail closed. ComfyUI workflows use `PreviewImage`; Torch Sentiment
-reads and then deletes every result from `SENTIMENTIZER_COMFYUI_TEMP_DIRECTORY`.
-That path must be the `temp` child beneath ComfyUI's `--temp-directory` value
-and must be mounted into both processes if they run in separate containers.
-
-#### Synchronous Image Generation
-- **Route**: `POST /v1/images/generate`
-- **Auth**: `Authorization: Bearer <api_key>` (required)
-- **Request Body**:
-  ```json
-  {
-    "prompt": "a calico cat in a teacup, soft window light",
-    "model": "krea_2",
-    "width": 1024,
-    "height": 1024,
-    "output_format": "png"
-  }
-  ```
-- **Command**:
-  ```bash
-  curl -X POST http://localhost:8000/v1/images/generate \
-    -H "Authorization: Bearer test-key-123" \
-    -H "Content-Type: application/json" \
-    -d '{"prompt": "a calico cat in a teacup", "model": "krea_2"}'
-  ```
-- **Response**:
-  ```json
-  {
-    "id": "img_ABCDEFGHIJKL",
-    "created": 1700000000,
-    "model": "krea_2",
-    "image_b64": "...",
-    "format": "png",
-    "width": 1024,
-    "height": 1024,
-    "seed": 42,
-    "steps": 8,
-    "guidance_scale": 1.0,
-    "latency_s": 4.8
-  }
-  ```
-
-Supported parameters are `prompt`, `model` (`"krea_2"` or `"ideogram_4"`),
-`steps`, `guidance_scale`, `width`, `height`, `seed`, `output_format`, `user`,
-and the `Idempotency-Key` header. Output is returned as `b64_json`. The current
-native workflows reject `negative_prompt`, `reference_images`, and URL output
-rather than silently ignoring them.
-
-Rate-limit headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`) are
-returned on every response. Exceeding the limit returns `429` with a `Retry-After` header.
-
-#### List Image Models
-- **Route**: `GET /v1/images/models`
-- **Auth**: Required
-- **Command**:
-  ```bash
-  curl http://localhost:8000/v1/images/models \
-    -H "Authorization: Bearer test-key-123"
-  ```
-
-#### Single Image Model Metadata
-- **Route**: `GET /v1/images/models/{name}`
-- **Auth**: Required
-- **Command**:
-  ```bash
-  curl http://localhost:8000/v1/images/models/krea_2 \
-    -H "Authorization: Bearer test-key-123"
-  ```
+Image generation moved to the [imagenate](https://github.com/edwardpyang/imagenate) service. `/v1/images/*`
+keeps its paths and behavior there. `python -m sentimentizer.serve --diffusion` and
+`SENTIMENTIZER_DIFFUSION_ENABLED` now exit with an error, and the old image settings
+are ignored with a warning. The imagenate `docs/configuration.md` lists the renamed
+environment variables.
 
 ---
 
@@ -475,7 +430,7 @@ async def predict_sentiment(self, inputs: list[dict]) -> list[dict]:
 
 ### Model loading and readiness
 
-`SentimentizerDeployment.__init__()` loads models synchronously. If loading fails, `self._ready` stays `False` and `/health/ready` returns 503. When image generation is enabled, readiness also performs a live ComfyUI sidecar check and returns 503 if it is unavailable. The process stays alive — it doesn't crash. Check `/health/ready` to confirm the configured backends are available.
+`SentimentizerDeployment.__init__()` loads models synchronously. If loading fails, `self._ready` stays `False` and `/health/ready` returns 503. The process stays alive — it doesn't crash. Check `/health/ready` to confirm the configured backends are available.
 
 ### `asyncio.to_thread()` for sync inference
 

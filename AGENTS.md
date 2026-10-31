@@ -3,8 +3,9 @@
 Sentimentizer is a PyTorch sentiment-analysis pipeline with four model
 architectures (RNN/LSTM, Transformer Encoder, Encoder-Decoder, ModernBERT). It
 supports single-node and distributed training via Ray Train, Ray Serve
-inference, an intent router, BGE-M3 embeddings, headless image generation
-through a ComfyUI sidecar, Prometheus metrics, and Grafana dashboards.
+inference, an intent router, BGE-M3 embeddings, Prometheus metrics, and Grafana
+dashboards. Image generation moved to the separate
+[imagenate](https://github.com/edwardpyang/imagenate) service.
 
 ## Working rules
 
@@ -89,7 +90,7 @@ sentimentizer/
   extractor.py         — Raw data extraction
   data_source.py       — Dataset source abstraction
   device.py            — resolve_device() / auto_detect_device()
-  safety.py            — Output safety checks
+  safety.py            — Prompt-injection patterns for web search results
   env.py               — Environment variable handling
   hf.py                — Hugging Face Hub upload/download
   models/
@@ -104,23 +105,15 @@ sentimentizer/
     base.py            — ServiceMetrics, _DummyServe fallback (no response builders)
     config.py          — ServeConfig dataclass + YAML/env loading (incl. cors_origins)
     models.py          — Pydantic request/response models
-    middleware.py      — Request-ID, body-size-limit middleware
     bge_only_app.py    — BGE-M3-only deployment
     embeddings_app.py  — Embeddings deployment
     embeddings_models.py
-    diffusion_app.py   — Image generation dispatcher (ComfyUIDeployment)
-    diffusion_models.py
     service.yaml       — Serve config
-  diffusion/
-    comfyui.py         — ComfyUI HTTP client, INT8 ConvRot workflows, checkpoint names
-    config.py          — diffusion_config.yaml loading, licensing gates
-    job_store.py       — JobStore (persists ComfyUI prompt UUIDs for cancellation)
-    moderation.py      — Output safety gate for Krea
-    image_utils.py
   embeddings/
     bge_m3.py          — BGE-M3 dense/sparse embeddings
     predictor.py
   router/              — Intent router (SentenceTransformer + LogisticRegression)
+    schemas.py         — Shared task, classification, and artifact metadata schemas
     config.py          — RouterConfig (alias SetFitConfig), RouteLabels, AugmentConfig
     model.py           — RouterModel: backbone + sklearn head
     seeds.py           — Golden example utterances (10 per category)
@@ -177,8 +170,8 @@ uv run <command>                 # run in the venv
 ```
 
 Extras: `dev`, `ray`, `router` (sentence-transformers, scikit-learn), `onnx`,
-`diffusion`, `mlx-diffusion` (Apple Silicon). Combos allowed:
-`uv sync --extra router,onnx`. CI installs `dev,diffusion,ray,onnx,router`.
+`embeddings`. Combos allowed: `uv sync --extra router,onnx`. CI installs
+`dev,ray,onnx,router`.
 
 ### Running tests
 
@@ -276,17 +269,25 @@ required after any dashboard change.
   The HTTP layer wraps this in `"prediction": {...}` with `"latency_s"`.
   `token_count` comes from `len(regex_tokenize(text))` computed during existing
   tokenization — no extra cost.
-- **`classify_batch()`** returns `{"prediction": {"label": "dietary", "score":
-  0.95, "token_count": 8}}` — no `text` or `category` key.
+- **Router Python and HTTP responses:** `classify_batch()` returns a list of
+  `{"prediction": {"label": "dietary", "score": 0.95, "token_count": 8}}`
+  dictionaries; `classify()` returns one item. HTTP single responses add
+  `latency_s`; HTTP batch responses wrap the list in `results`, with `count`
+  and `latency_s`. Prediction objects have no `text`, `category`, or `model`
+  field. Shared Pydantic task/classification schemas live in `router/schemas.py`;
+  HTTP envelopes in `serve/models.py` reuse them. Router handlers return typed
+  response models and validate before success accounting. Scores are finite in
+  `[0,1]`; counts and latency are nonnegative; batches must be complete. Labels
+  come from the loaded artifact and probabilities follow `head.classes_` order.
+  Keep additional task configurations external to the food-focused defaults.
 - **FastAPI + `@serve.ingress`, one app per deployment.** There is **no mounted
   `v1` sub-app** — routes declare their full path on the app returned by
   `create_fastapi_app()`, e.g. `@app.post("/v1/sentiment/predict")`. Health
   endpoints stay unversioned (`/health`, `/health/live`, `/health/ready`).
 - **Routes are namespaced by domain; the flat forms are deprecated.** Canonical:
   `/v1/sentiment/{predict,batch,tokenize,models,models/{name}}`,
-  `/v1/router/{predict,batch,models}`, `/v1/embeddings`,
-  `/v1/embeddings/dense`, and `/v1/images/*` on a separate deployment with
-  `route_prefix="/v1/images"`. The unnamespaced `/v1/predict`, `/v1/batch`,
+  `/v1/router/{predict,batch,models}`, `/v1/embeddings`, and
+  `/v1/embeddings/dense`. `/v1/images/*` belongs to the imagenate service. The unnamespaced `/v1/predict`, `/v1/batch`,
   `/v1/tokenize`, `/v1/models`, `/v1/models/{name}` still exist but are declared
   `deprecated=True` — do not add new callers.
 - **`GET /metrics` serves per-replica Prometheus text**, rendered by
@@ -300,13 +301,12 @@ required after any dashboard change.
   middleware. Use a factory such as `create_fastapi_app()` so each deployment
   gets its own instance.
 - **Trailing slashes.** `@app.post("")` raises `FastAPIError: Prefix and path
-  cannot be both empty`. A deployment with `route_prefix="/v1/images"` must use
-  `@app.post("/")`, so clients must send `/v1/images/` or get a 307. Document
+  cannot be both empty`. A deployment with a non-root `route_prefix` must use
+  `@app.post("/")`, so clients must send the trailing slash or get a 307. Document
   such endpoints with the trailing slash.
 - **`serve.start()` timeouts need an explicit object.** `http_options={"request_timeout_s": 600}`
   is silently ignored; pass
-  `ray.serve.config.HTTPOptions(..., request_timeout_s=600)`. Required for slow
-  image generation.
+  `ray.serve.config.HTTPOptions(..., request_timeout_s=600)`.
 - **Middleware order:** CORS is outermost (added last, processed first) with
   `allow_origins=cfg.cors_origins` (default `["*"]`, configurable via
   `SENTIMENTIZER_CORS_ORIGINS`, comma-separated). Request-ID is inner to CORS:
@@ -328,7 +328,8 @@ required after any dashboard change.
   model exists but is not loaded.
 - **`serve/base.py` holds `ServiceMetrics`, `_DummyServe`, and
   `render_service_metrics()`.** Response dicts are built directly in route
-  handlers — there are no response-builder helpers.
+  handlers, except router handlers return typed response models — there are no
+  response-builder helpers.
 - **Router loads lazily.** `SentimentPredictor.__init__` does not load the
   router model; `_ensure_router_loaded()` runs on the first
   `classify()`/`classify_batch()` and memoizes success *and* failure. Serve
@@ -463,48 +464,25 @@ required after any dashboard change.
   `num_epochs=1`, `batch_size=16`, `max_seq_length=512`, `seed=42`,
   `output_dir=models/router`. Move to `mxbai-embed-large-v1` (335M) only if
   evaluation thresholds are not met.
-- **Categories** in `RouteLabels`: dietary (0) — allergies, celiac, FODMAP,
+- **Default food categories** in `RouteLabels`: dietary (0) — allergies, celiac, FODMAP,
   ingredient safety; service (1) — wait times, staff, reservations; general (2)
   — ambiance, price, general food quality.
 - **Seeds**: 10 utterances per category in `seeds.py`, expanded by `augment.py`
   (`AugmentConfig`: GLM 5.1 via Ollama at `http://localhost:11434/api/generate`,
   default model `glm-5.1:cloud`, 50 variations per seed).
-- **Targets**: inter-class similarity < 0.65, intra-class > 0.85.
+- **Generic task configuration:** `RouterConfig.task` defines ordered labels,
+  descriptions, task/version IDs, input format, and optional fallback. Artifacts
+  save that spec; runtime code must not substitute `RouteLabels` for custom
+  vocabularies. `RouterModel.classify_batch()` returns `RouterClassification`
+  objects without loading sentiment weights. Empty augmentation.seed_path uses
+  bundled seeds only for the default food task; custom tasks supply JSONL seeds.
+- **Evaluation** reports all saved classes, observed centroid similarities,
+  and confidence statistics. The centroid matrix diagonal is self-similarity,
+  not an intra-class metric. The optional historical tau heuristic uses the
+  configured fallback and is not a calibrated serving policy.
 - Pipeline: `make router-augment` → `make router-train` → `make router-evaluate`;
   `make upload-router` pushes to the Hub.
 - Router ONNX export is deferred to v2 — the router runs Python inference.
-
-### Headless image generation
-
-- **ComfyUI is a sidecar.** Sentimentizer never imports ComfyUI or reserves its
-  CUDA device; `ComfyUIDeployment` serializes HTTP submissions to the separately
-  managed process at `comfyui_base_url`.
-- **Krea 2 and Ideogram 4 only.** Native INT8 ConvRot workflows and checkpoint
-  filenames live in `diffusion/comfyui.py` and `diffusion_config.yaml`. Do not
-  reintroduce SDXL, SD3.5, FLUX.2 Klein, Diffusers, or MFLUX without an explicit
-  product decision.
-- **No custom ComfyUI nodes.** Workflows use only nodes shipped by current
-  ComfyUI; startup validates required node classes and checkpoint choices before
-  the deployment becomes ready.
-- **Licensing gates are explicit and must not be weakened.**
-  `ideogram_4_enabled=true` requires `ideogram_4_license_accepted=true` (the
-  checkpoint is non-commercial). `krea_2_enabled=true` requires both
-  `krea_2_license_accepted=true` and `image_moderation_url`, and the moderation
-  service must return `safe: true` — failures block release. Do not restore
-  implicit Krea enablement through `--diffusion`.
-- **Cancellation uses ComfyUI prompt UUIDs**: persist the backend UUID in
-  `JobStore`, call ComfyUI's `/api/jobs/{id}/cancel`, then
-  `DeploymentResponse.cancel()` when a local response exists. Never pass a Serve
-  `DeploymentResponse` to `ray.cancel()`.
-- **Output is deleted.** Workflows use native `PreviewImage`, not `SaveImage`.
-  `comfyui_temp_directory` is required whenever image models are enabled; the
-  client validates the returned path stays beneath it and unlinks each artifact
-  after reading.
-- **Text-to-image only.** Reject `negative_prompt`, `reference_images`, and
-  `response_format=url` explicitly rather than silently dropping them.
-- **ComfyUI must stay private** — loopback or a protected service network. Its
-  HTTP API has no authentication here; clients authenticate only through
-  Sentimentizer's `/v1/images/*` middleware.
 
 ## Ray 2.55 API Conventions
 

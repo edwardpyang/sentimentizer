@@ -14,10 +14,18 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from sentimentizer.router.schemas import (
+    RouterArtifactMetadata,
+    RouterClassification,
+    RouterTaskSpec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +67,8 @@ class RouterModel:
         backbone: Any,
         head: Any | None = None,
         labels: list[str] | None = None,
+        *,
+        task: RouterTaskSpec | None = None,
     ) -> None:
         """Initialize RouterModel.
 
@@ -70,7 +80,29 @@ class RouterModel:
         """
         self.backbone = backbone
         self.head = head
-        self.labels = labels or []
+        if task is not None and labels is not None and tuple(labels) != task.labels:
+            raise ValueError("Model labels conflict with task labels")
+        metadata = RouterArtifactMetadata(labels=labels or [], task=task)
+        self.task = metadata.task
+        self.labels = list(metadata.labels)
+
+    @staticmethod
+    def read_metadata(path: str | Path) -> RouterArtifactMetadata | None:
+        """Read a sidecar without importing the optional model dependencies."""
+        path = Path(path)
+        for name in ("router_config.json", "config_setfit.json"):
+            try:
+                with (path / name).open() as source:
+                    data = json.load(source)
+            except FileNotFoundError:
+                continue
+            if not isinstance(data, dict):
+                raise ValueError("Router metadata must be an object")
+            labels = data.get("labels", [])
+            if isinstance(labels, dict):
+                data["labels"] = [labels[str(i)] for i in range(len(labels))]
+            return RouterArtifactMetadata.model_validate(data)
+        return None
 
     # ------------------------------------------------------------------
     # Class methods: loading
@@ -102,6 +134,7 @@ class RouterModel:
         if not path.exists():
             raise FileNotFoundError(f"Model path not found: {path}")
 
+        metadata = cls.read_metadata(path) or RouterArtifactMetadata()
         SentenceTransformer = _get_sentence_transformers()
         joblib = _get_joblib()
 
@@ -120,16 +153,7 @@ class RouterModel:
             )
             return cls._migrate_legacy_setfit_model(path, backbone)
 
-        # Load config
-        config_path = path / "router_config.json"
-        labels = []
-        if config_path.exists():
-            with open(config_path) as f:
-                config = json.load(f)
-            labels = config.get("labels", [])
-            logger.info(f"Loaded router config: labels={labels}")
-
-        return cls(backbone=backbone, head=head, labels=labels)
+        return cls(backbone=backbone, head=head, labels=metadata.labels, task=metadata.task)
 
     @classmethod
     def _migrate_legacy_setfit_model(cls, path: Path, backbone: Any) -> RouterModel:
@@ -163,20 +187,7 @@ class RouterModel:
                 except Exception as e:
                     logger.warning(f"Failed to load SetFit head from {head_path}: {e}")
 
-        # Try loading labels from config_setfit.json
-        labels = []
-        config_path = path / "config_setfit.json"
-        if config_path.exists():
-            try:
-                with open(config_path) as f:
-                    config = json.load(f)
-                labels = config.get("labels", [])
-                if isinstance(labels, dict):
-                    # SetFit stores labels as {idx: name}, convert to list
-                    labels = [labels[str(i)] for i in range(len(labels))]
-                logger.info(f"Migrated SetFit labels: {labels}")
-            except Exception as e:
-                logger.warning(f"Failed to load SetFit config from {config_path}: {e}")
+        metadata = cls.read_metadata(path) or RouterArtifactMetadata()
 
         if head is None:
             raise RuntimeError(
@@ -185,7 +196,7 @@ class RouterModel:
                 f"Please retrain the router model using the updated training pipeline."
             )
 
-        return cls(backbone=backbone, head=head, labels=labels)
+        return cls(backbone=backbone, head=head, labels=metadata.labels, task=metadata.task)
 
     # ------------------------------------------------------------------
     # Save / push
@@ -218,14 +229,21 @@ class RouterModel:
             logger.info(f"Saved classification head to {head_path}")
 
         # Save config
-        config = {
-            "model_type": "router",
-            "labels": self.labels,
-            "head_type": type(self.head).__name__ if self.head else None,
-        }
+        metadata = RouterArtifactMetadata(
+            labels=self.labels,
+            head_type=type(self.head).__name__ if self.head is not None else None,
+            task=self.task,
+        )
         config_path = path / "router_config.json"
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
+        # A metadata reader sees the old complete file or the new complete file.
+        with tempfile.NamedTemporaryFile(mode="w", dir=path, delete=False) as target:
+            temporary_path = Path(target.name)
+            try:
+                target.write(metadata.model_dump_json(indent=2))
+                target.close()
+                temporary_path.replace(config_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
         logger.info(f"Saved router config to {config_path}")
 
     def push_to_hub(self, repo_id: str, **kwargs: Any) -> None:
@@ -254,6 +272,57 @@ class RouterModel:
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
+
+    def class_labels(self) -> list[str]:
+        """Resolve probability-column labels from the classifier's class order."""
+        if self.head is None:
+            raise RuntimeError("Router classification head is not loaded")
+        classes = np.asarray(self.head.classes_)
+        if classes.ndim != 1 or len(classes) < 2:
+            raise ValueError("Router head must have at least two classes")
+        values = classes.tolist()
+        labels = list(self.task.labels) if self.task is not None else list(self.labels)
+        if not labels and all(isinstance(value, str) for value in values):
+            labels = values
+        if len(labels) != len(values) or len(set(labels)) != len(labels):
+            raise ValueError("Router head classes must cover the saved label vocabulary")
+        resolved = []
+        for value in values:
+            if isinstance(value, str) and value in labels:
+                resolved.append(value)
+            elif (
+                isinstance(value, Integral)
+                and not isinstance(value, bool)
+                and 0 <= int(value) < len(labels)
+            ):
+                resolved.append(labels[int(value)])
+            else:
+                raise ValueError("Router head class has no valid saved label mapping")
+        if len(set(resolved)) != len(labels):
+            raise ValueError("Router head classes must map uniquely to saved labels")
+        return resolved
+
+    def classify_batch(self, texts: list[str]) -> list[RouterClassification]:
+        """Classify texts with one encoding pass and validated native values."""
+        labels = self.class_labels()
+        if not texts:
+            return []
+        probabilities = np.asarray(self.head.predict_proba(self.model_encode(texts)))
+        if probabilities.dtype.kind not in "fiu":
+            raise ValueError("Router probabilities must be numeric values, not booleans or strings")
+        if probabilities.shape != (len(texts), len(labels)):
+            raise ValueError("Router probability dimensions do not match inputs and classes")
+        if (
+            not np.isfinite(probabilities).all()
+            or (probabilities < 0).any()
+            or (probabilities > 1).any()
+        ):
+            raise ValueError("Router probabilities must be finite and between zero and one")
+        winners = probabilities.argmax(axis=1)
+        return [
+            RouterClassification(label=labels[int(column)], score=float(row[column]))
+            for row, column in zip(probabilities, winners, strict=True)
+        ]
 
     def model_encode(self, texts: list[str] | str) -> np.ndarray:
         """Encode texts to embeddings using the backbone.
