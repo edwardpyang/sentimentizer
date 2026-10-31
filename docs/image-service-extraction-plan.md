@@ -119,6 +119,9 @@ imagenate/
   AGENTS.md                           NEW  image conventions moved from sentimentizer AGENTS.md
   .rules/                             NEW  copies of python-style, dry, solid, observability, prompts-and-constants
   .github/workflows/ci.yaml           NEW  ruff format --check, ruff check, pyright, pytest; permissions: contents: read
+  .github/workflows/comfyui-compat.yaml NEW  runs the startup checks against pinned and latest ComfyUI (M4b)
+  COMFYUI_REVISION                    NEW  pinned ComfyUI commit; single source for docs, CI, and the sidecar image
+  scripts/check_comfyui_compat.py     NEW  placeholder checkpoints + runtime validation + workflow validation
   k8s/                                NEW  deployment, service, ingress (path /v1/images, proxy-body-size 4m), pdb
   docs/                               MOVED serving (image section), configuration (image section), historical plans
   imagenate/
@@ -344,6 +347,46 @@ unless `seed` is fixed, so fix it).
 **Gate:** `make ci` green; container builds; the probes pass against a
 running ComfyUI.
 
+### M4b. ComfyUI compatibility check (new repo, ~0.5 day)
+
+ComfyUI usually supports new open-weight models within days of release, but
+its node names, inputs, and enum values change between releases. Today a
+mismatch shows up only when the service starts against a ComfyUI it hasn't
+seen. This milestone adds a CI job that runs the same startup checks against
+both the pinned and the latest ComfyUI release, without a GPU or real weights.
+
+1. **Pin in one place.** Move the ComfyUI commit pinned in the README and
+   `docs/serving.md` (`feca51a`) into a `COMFYUI_REVISION` file. Docs, CI, and
+   the sidecar image read it from there.
+2. **Make the startup check reusable.** Extract
+   `ComfyUIDeployment._validate_runtime()` into a plain function in
+   `diffusion/comfyui.py`, with no behavior change:
+   ```python
+   def validate_comfyui_runtime(
+       client: ComfyUIClient, models: dict[str, ImageModelConfig]
+   ) -> None: ...
+   ```
+   Move `_BASE_NODES`, `_MODEL_NODES`, and `_choices()` with it.
+   `ComfyUIDeployment.__init__` calls the function, so the deployment and CI
+   share one implementation.
+3. **`scripts/check_comfyui_compat.py`** does four things, against a running ComfyUI:
+   - Creates empty placeholder files named after every checkpoint in `diffusion_config.yaml` (via `load_diffusion_config()`), under ComfyUI's `models/diffusion_models`, `models/text_encoders`, and `models/vae`. These make the files appear in `/object_info` choices without downloading any weights.
+   - Calls `validate_comfyui_runtime()` for every model. This catches missing or renamed node classes and checkpoint-loader changes.
+   - Builds each model's workflow with `build_krea_2_workflow` / `build_ideogram_4_workflow` and submits it to `POST /prompt`. ComfyUI validates the graph (input names, types, enum values) before queueing, so a renamed or removed input fails here with `node_errors`, which the node-class check alone would miss.
+   - Cancels each accepted prompt immediately, since the placeholder weights can't load.
+4. **`.github/workflows/comfyui-compat.yaml`:**
+   - Checks out ComfyUI at either the pinned revision or the latest release tag (from the GitHub releases API).
+   - Installs CPU-only torch and ComfyUI's requirements, then starts ComfyUI with `--cpu --listen 127.0.0.1`.
+   - Runs the script.
+   - Triggers:
+     - The **pinned** run on pull requests that touch `diffusion/`, `COMFYUI_REVISION`, or the workflow file, so our own workflow-builder mistakes are caught.
+     - The **latest** run weekly and on manual dispatch, so upstream breakage shows up before anyone bumps the pin.
+   - `permissions: contents: read`. A failure shows as a failed scheduled run. Opening an issue automatically would need `issues: write`; leave that out unless wanted.
+5. **Bumping the pin** is a PR that edits `COMFYUI_REVISION`. That PR's pinned run is the gate.
+
+**Gate:** both runs green against the current pin and the current latest
+release; `make ci` green.
+
 ### M5. Cutover (ops, no code)
 
 1. Deploy the new service with the current image config translated to `IMAGENATE_*` names per the rename table, and the same secret values (API keys, moderation key).
@@ -397,6 +440,8 @@ Only after M5 has run cleanly for an agreed soak period.
 | `test_ops_routes.py` (new) | `/health/live`; `/health/ready` 200 and 503 (ComfyUI down; job store missing) with the expected keys; `/metrics` prefix and counters. |
 | `test_entrypoint.py` (new) | `RAY_ENABLE_UV_RUN_RUNTIME_ENV` set at import; `IMAGENATE_API_KEYS` exported from config; `main()` calls `ray.init(address="local", ...)` and `HTTPOptions(request_timeout_s=...)` (mock `ray`/`serve`); `ValueError` when no model is enabled. |
 | `test_openapi_parity.py` (new) | `/v1/images` OpenAPI schema equals the snapshot taken from sentimentizer. |
+| `test_comfyui.py` additions (new) | `validate_comfyui_runtime()` with a mocked client: missing node, missing checkpoint, and all present. These cover the logic the compatibility job exercises against a real ComfyUI. |
+| `comfyui-compat.yaml` (CI, new) | Real ComfyUI, pinned and latest: node classes, checkpoint choices, and `/prompt` graph validation for every enabled model's workflow. |
 | `test_serve.py` (sentimentizer) | Fixtures without image attributes; `/health/ready` without image keys. |
 | `test_bge_only_serve.py`, next to the existing `build_parser` tests (sentimentizer) | `--diffusion` and `SENTIMENTIZER_DIFFUSION_ENABLED` exit non-zero with the pointer message. |
 | `test_serve_config` cases in `test_serve.py` (sentimentizer) | Warning when a removed image env var is set. `ServeConfig` no longer accepts image keys from YAML. Decide whether stale keys in a custom YAML are an error or a warning; recommend warning, to match env. |
@@ -418,7 +463,9 @@ Only after M5 has run cleanly for an agreed soak period.
 | R11 | **Request timeout dropped.** `http_options={"request_timeout_s": ...}` is silently ignored. | Use `HTTPOptions` (asserted in `test_entrypoint.py`). |
 | R12 | **Dependency drift.** `fastapi==0.136.1` is pinned because of a Ray Serve 2.55.1 pickling issue. | Copy the pin and its comment. Upgrade only together with Ray. |
 | R13 | **Lockfile churn when removing the `diffusion` extra.** | Review the `uv lock` diff; hand-edit if unrelated markers change (as in #74). |
-| R14 | **Optional heavy deps.** | The new service needs no torch. Add a CI step that asserts `import torch` fails in its environment, so the dependency can't creep back through a transitive import. |
+| R14 | **Optional heavy deps.** | The new service needs no torch. Add a CI step that asserts `import torch` fails in its environment, so the dependency can't creep back through a transitive import. The compatibility job's CPU torch is installed only into ComfyUI's own environment. |
+| R15 | **ComfyUI drift.** New releases rename or remove nodes, inputs, or enum values, and today that surfaces only at startup. | M4b: weekly run against the latest release, a pinned run on relevant PRs, and one pin file. |
+| R16 | **Compatibility job gives false confidence.** It proves the graph is accepted, not that real weights load or images look right. | State this in the job's docs. Bumping the pin still needs one real generation per model on a GPU host before release. |
 
 ### Repo-specific risk classes from `.skills/plan-feature` that do not apply
 
@@ -435,6 +482,8 @@ optional keys.
 | Nothing outside `serve/app.py`, `serve/__main__.py`, `serve/config.py`, `safety.py` and the moved files references diffusion or ComfyUI code. | `grep`, 2026-10-31 |
 | `ray.init(address="local")` always starts a new local instance. | Ray 2.55.1 source, 2026-10-31 |
 | NGINX ingress prefers the longest Prefix match, so `/v1/images` beats `/`. | Documented NGINX ingress behavior; confirm on the target cluster during M5. |
+| ComfyUI's `POST /prompt` validates the graph (node types, input names, enum values) and returns `node_errors` before queueing. | **Not verified**: GitHub was unreachable from the planning sandbox. Check against the pinned revision at the start of M4b. |
+| Empty placeholder files appear in `/object_info` loader choices, and ComfyUI starts with `--cpu` on a GPU-less runner. | **Not verified**. Check at the start of M4b. If placeholders aren't listed, skip the checkpoint-choice assertion in CI and keep the node and `/prompt` checks. |
 | The ComfyUI and moderation clients need no third-party HTTP library. | Both use `urllib`; read 2026-10-31 |
 | `prompt_blocklist_path` is unused. | `grep`, 2026-10-31 |
 | The `comfyui_images` metrics collector is never rendered. | `grep` for `to_prometheus` / `/metrics`, 2026-10-31 |
@@ -493,6 +542,14 @@ service is unrelated to sentiment. Review of that change:
 - (d) The old R8 (shared host/port names colliding on one host) no longer applies once the prefixes differ.
 - (e) Added D5 so the hostname move stays out of the cutover.
 
+**Pass 4 (ComfyUI compatibility check, 2026-10-31).** Added M4b. Review:
+
+- (a) The node-class check alone misses renamed inputs, so the job also submits each built workflow to `/prompt`.
+- (b) Copying `_validate_runtime` into a script would create a second implementation that drifts; extracting it into a function keeps one (`.rules/dry.md`).
+- (c) The pin lived in two docs; moved to `COMFYUI_REVISION`.
+- (d) The job can't prove real weights work, so R16 keeps a manual GPU check when bumping the pin.
+- (e) Two ComfyUI behaviors it relies on are unverified and listed as assumptions.
+
 ## Follow-up: drop Ray Serve
 
 After the new service has run in production, this becomes a separate plan.
@@ -512,7 +569,8 @@ R1, R2, R11 and R12 go away with it. Estimated at 3-4 days.
 | M2 Config, env rename and entry point | new | 0.5-0.75 day |
 | M3 Parity check | both | 0.5 day |
 | M4 Packaging and deployment | new | 0.5-1 day |
+| M4b ComfyUI compatibility check | new | 0.5 day |
 | M5 Cutover | ops | under 1 hour plus soak time |
 | M6 Remove from sentimentizer | sentimentizer | 0.5 day |
 | M7 Docs | sentimentizer | 1-2 hours |
-| **Total** | | **about 3-4 days of work**, plus soak time |
+| **Total** | | **about 3.5-4.5 days of work**, plus soak time |
