@@ -21,6 +21,10 @@ training:
   batch_size: 16                    # Training batch size
   max_seq_length: 512               # Maximum token sequence length
   seed: 42                          # Random seed for reproducibility
+  training_mode: contrastive        # contrastive or frozen
+  learning_rate: 0.00002
+  warmup_ratio: 0.1
+  head_max_iter: 1000
   output_dir: "models/router"       # Directory to save the trained model
 
 # Augmentation configuration (GLM 5.1 via Ollama)

@@ -58,6 +58,10 @@ class RouterConfig:
     seed: int = 42
     output_dir: Path = Path(DEFAULT_ROUTER_MODEL_PATH)
     task: RouterTaskSpec = field(default_factory=lambda: FOOD_TASK_SPEC.model_copy(deep=True))
+    training_mode: str = "contrastive"
+    learning_rate: float = 2e-5
+    warmup_ratio: float = 0.1
+    head_max_iter: int = 1000
 
 
 # Backward-compatible alias — existing code that references SetFitConfig
@@ -122,6 +126,10 @@ _ENV_OVERRIDES: dict[str, tuple[str, str, type]] = {
     "SENTIMENTIZER_ROUTER_MAX_SEQ_LENGTH": ("training", "max_seq_length", int),
     "SENTIMENTIZER_ROUTER_SEED": ("training", "seed", int),
     "SENTIMENTIZER_ROUTER_OUTPUT_DIR": ("training", "output_dir", str),
+    "SENTIMENTIZER_ROUTER_TRAINING_MODE": ("training", "training_mode", str),
+    "SENTIMENTIZER_ROUTER_LEARNING_RATE": ("training", "learning_rate", float),
+    "SENTIMENTIZER_ROUTER_WARMUP_RATIO": ("training", "warmup_ratio", float),
+    "SENTIMENTIZER_ROUTER_HEAD_MAX_ITER": ("training", "head_max_iter", int),
     "SENTIMENTIZER_AUGMENT_MODEL": ("augmentation", "model", str),
     "SENTIMENTIZER_AUGMENT_OLLAMA_URL": ("augmentation", "ollama_url", str),
     "SENTIMENTIZER_AUGMENT_VARIATIONS_PER_SEED": ("augmentation", "variations_per_seed", int),

@@ -556,6 +556,8 @@ def router_evaluate(ctx: click.Context, model_path: str, data: str | None) -> No
             "text": [row["text"] for row in records],
             "label": [row["label"] for row in records],
         }
+        if any("group_id" in row for row in records):
+            eval_ds["group_id"] = [row.get("group_id") for row in records]
         report = evaluate_router(model, eval_ds)
         click.echo(
             json.dumps(
@@ -564,6 +566,80 @@ def router_evaluate(ctx: click.Context, model_path: str, data: str | None) -> No
         )
     else:
         click.echo("No evaluation data provided. Use --data to specify a JSONL file.")
+
+
+@router.command("calibrate")
+@click.option("--model-path", required=True, type=click.Path(exists=True))
+@click.option("--calibration-data", required=True, type=click.Path(exists=True))
+@click.option("--policy-data", required=True, type=click.Path(exists=True))
+@click.option("--output-dir", required=True, type=click.Path())
+@click.option("--min-accuracy", default=None, type=click.FloatRange(min=0, max=1, min_open=True))
+@click.option("--min-accepted", default=None, type=click.IntRange(min=1))
+def router_calibrate(
+    model_path: str,
+    calibration_data: str,
+    policy_data: str,
+    output_dir: str,
+    min_accuracy: float | None,
+    min_accepted: int | None,
+) -> None:
+    """Fit probability calibration and select acceptance on separate held-out files."""
+    from pathlib import Path
+
+    from sentimentizer.router.calibration import (
+        DEFAULT_MIN_ACCEPTED,
+        DEFAULT_MIN_ACCURACY,
+        calibrate_router,
+    )
+    from sentimentizer.router.dataset import load_router_records
+    from sentimentizer.router.model import RouterModel
+
+    if Path(model_path).resolve() == Path(output_dir).resolve():
+        raise click.UsageError("Use a different output-dir to preserve the uncalibrated artifact")
+    model = calibrate_router(
+        RouterModel.from_pretrained(model_path),
+        load_router_records(calibration_data),
+        load_router_records(policy_data),
+        min_accuracy=min_accuracy if min_accuracy is not None else DEFAULT_MIN_ACCURACY,
+        min_accepted=min_accepted if min_accepted is not None else DEFAULT_MIN_ACCEPTED,
+    )
+    model.save_pretrained(output_dir)
+    if model.acceptance_policy is not None:
+        click.echo(model.acceptance_policy.model_dump_json(indent=2))
+
+
+@router.command("benchmark")
+@click.option("--train-data", required=True, type=click.Path(exists=True))
+@click.option("--validation-data", required=True, type=click.Path(exists=True))
+@click.option("--test-data", required=True, type=click.Path(exists=True))
+@click.option("--output-dir", required=True, type=click.Path())
+@click.option("--config", "config_path", type=click.Path(exists=True))
+@click.option("--repeats", default=None, type=click.IntRange(min=1))
+def router_benchmark(
+    train_data: str,
+    validation_data: str,
+    test_data: str,
+    output_dir: str,
+    config_path: str | None,
+    repeats: int | None,
+) -> None:
+    """Compare TF-IDF, frozen encoder and contrastive encoder on the same split."""
+    from dataclasses import replace
+    from pathlib import Path
+
+    from sentimentizer.router.benchmark import BENCHMARK_REPEATS, benchmark_router
+    from sentimentizer.router.config import load_router_config
+    from sentimentizer.router.dataset import load_router_records
+
+    config, _ = load_router_config(config_path)
+    benchmark_router(
+        replace(config, output_dir=Path(output_dir)),
+        load_router_records(train_data),
+        load_router_records(validation_data),
+        load_router_records(test_data),
+        repeats=repeats if repeats is not None else BENCHMARK_REPEATS,
+    )
+    click.echo(f"Benchmark report: {Path(output_dir) / 'benchmark_report.json'}")
 
 
 @router.command("push")

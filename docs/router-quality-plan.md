@@ -8,6 +8,13 @@ Milestone 1 is implemented. Focused tests: 68 passed. `make ci`: 728 passed,
 2 skipped; lint/type checks and wheel/sdist builds passed. Local tests use the
 existing environment with PYTHONPATH pointing to this managed worktree.
 
+Milestone 2 is implemented. `make ci`: 743 passed, 1 skipped; lint/type checks
+and wheel/sdist builds passed. Tests include real frozen-head calibration,
+joblib persistence, CLI calibration, all three benchmark result paths, and a
+tiny offline trainable sentence encoder trained twice and reloaded. Source
+inspection found fit() resets the training seed through default Trainer args;
+the native old_fit() loop preserves the explicitly configured RNG seed.
+
 ## Goal and scope
 
 Implement the five router review recommendations on main at d5396bd. Preserve

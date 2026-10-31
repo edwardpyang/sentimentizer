@@ -107,8 +107,8 @@ def test_training_uses_task_and_all_loaded_settings(monkeypatch, tmp_path):
     assert model.task == task
     assert model.labels == ["a", "b"]
     assert backbone.max_seq_length == 64
-    assert backbone.fit.call_args.kwargs["epochs"] == 3
-    assert backbone.fit.call_args.kwargs["train_objectives"][0][0].batch_size == 4
+    assert backbone.old_fit.call_args.kwargs["epochs"] == 3
+    assert backbone.old_fit.call_args.kwargs["train_objectives"][0][0].batch_size == 4
     save.assert_called_once()
 
 

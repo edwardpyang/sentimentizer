@@ -11,6 +11,7 @@ dependency.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 from pathlib import Path
@@ -22,7 +23,9 @@ from sklearn.linear_model import LogisticRegression
 from torch.utils.data import DataLoader
 
 from sentimentizer.router.config import RouterConfig
+from sentimentizer.router.dataset import assert_disjoint
 from sentimentizer.router.model import RouterModel
+from sentimentizer.router.provenance import add_dataset, dataset_records, training_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +109,7 @@ def train_router(
         train_dataset: Training dataset with 'text' and 'label' columns.
                        Can be a HuggingFace Dataset or a dict with
                        'text' and 'label' keys.
-        eval_dataset: Optional evaluation dataset (unused in training,
-                      reserved for future use).
+        eval_dataset: Independent validation dataset; metrics are saved with the run.
 
     Returns:
         Trained RouterModel.
@@ -135,6 +137,28 @@ def train_router(
         raise ValueError("Training data must include every configured task class")
     if config.max_seq_length <= 0:
         raise ValueError("max_seq_length must be positive")
+    if config.training_mode not in {"contrastive", "frozen"}:
+        raise ValueError("training_mode must be contrastive or frozen")
+    if (
+        config.num_epochs < 1
+        or config.num_iterations < 1
+        or config.batch_size < 1
+        or not 0 <= config.warmup_ratio <= 1
+        or config.learning_rate <= 0
+        or config.head_max_iter < 1
+    ):
+        raise ValueError("Invalid router training hyperparameters")
+    train_records = dataset_records(train_dataset)
+    validation_records = dataset_records(eval_dataset) if eval_dataset is not None else []
+    if eval_dataset is not None:
+        if not validation_records:
+            raise ValueError("Validation dataset must not be empty")
+        assert_disjoint(train_records, validation_records)
+        for row in validation_records:
+            config.task.label_id(row["label"])
+    from transformers import set_seed
+
+    set_seed(config.seed)
     logger.info(f"Training router model on {len(texts)} examples, {len(set(labels))} classes")
 
     # Step 1: Load backbone
@@ -142,44 +166,50 @@ def train_router(
     backbone = SentenceTransformer(config.base_model)
     backbone.max_seq_length = config.max_seq_length
 
-    # Step 2: Generate contrastive pairs
-    pairs = generate_contrastive_pairs(
-        texts=texts,
-        labels=labels,
-        num_iterations=config.num_iterations,
-        seed=config.seed,
-    )
-
-    # Step 3: Fine-tune backbone with CosineSimilarityLoss
-    train_dataloader = DataLoader(pairs, batch_size=config.batch_size, shuffle=True)
-    train_loss = CosineSimilarityLoss(model=backbone)
-
-    logger.info(
-        f"Starting contrastive fine-tuning: "
-        f"{config.num_epochs} epochs, batch_size={config.batch_size}"
-    )
-    backbone.fit(
-        train_objectives=[(train_dataloader, train_loss)],
-        epochs=config.num_epochs,
-        warmup_steps=int(0.1 * len(train_dataloader)),
-        show_progress_bar=True,
-    )
+    if config.training_mode == "contrastive":
+        pairs = generate_contrastive_pairs(texts, labels, config.num_iterations, config.seed)
+        train_dataloader = DataLoader(pairs, batch_size=config.batch_size, shuffle=True)
+        train_loss = CosineSimilarityLoss(model=backbone)
+        logger.info(
+            "Fine-tuning router backbone",
+            extra={"epochs": config.num_epochs, "batch_size": config.batch_size},
+        )
+        # fit() builds Trainer arguments with its own default RNG seed. The
+        # native PyTorch loop respects the configured seed set above.
+        backbone.old_fit(
+            train_objectives=[(train_dataloader, train_loss)],
+            epochs=config.num_epochs,
+            warmup_steps=int(config.warmup_ratio * config.num_epochs * len(train_dataloader)),
+            optimizer_params={"lr": config.learning_rate},
+            show_progress_bar=True,
+        )
 
     # Step 4: Encode training texts and fit classification head
     logger.info("Encoding training texts with fine-tuned backbone...")
     embeddings = backbone.encode(texts, convert_to_numpy=True)
 
     logger.info("Fitting LogisticRegression classification head...")
-    head = LogisticRegression(max_iter=1000, solver="lbfgs")
+    head = LogisticRegression(
+        max_iter=config.head_max_iter, solver="lbfgs", random_state=config.seed
+    )
     head.fit(embeddings, labels)
 
     # Step 5: Build RouterModel
-    model = RouterModel(backbone=backbone, head=head, task=config.task)
+    provenance = training_provenance(config, train_records, backbone)
+    if validation_records:
+        add_dataset(provenance, "validation", validation_records)
+    model = RouterModel(backbone=backbone, head=head, task=config.task, provenance=provenance)
 
     # Step 6: Save model
     output_path = Path(config.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(output_path))
+    if validation_records:
+        from sentimentizer.router.evaluate import evaluate_router
+
+        report = evaluate_router(model, eval_dataset, check_independence=False)
+        report["similarity_matrix"] = report["similarity_matrix"].tolist()
+        (output_path / "validation_report.json").write_text(json.dumps(report, indent=2))
     logger.info(f"Router model saved to {output_path}")
 
     return model
