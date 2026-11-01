@@ -68,6 +68,9 @@ does not recursively trigger the release-published workflow.
 `test` (pytest), a package build, and an isolated installed-wheel smoke check.
 CI and PyPI publishing share `.github/workflows/verify.yaml`, which also runs
 pandas-floor compatibility tests and a Docker smoke check outside the source tree.
+The top-level CI gate must keep the exact name `lint and test`, required by main's
+branch protection. It reports failure if shared verification fails, is cancelled,
+or is skipped; reusable workflow job names alone do not satisfy this context.
 
 ```bash
 make ci        # full local mirror of CI — run before pushing

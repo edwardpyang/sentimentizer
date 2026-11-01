@@ -216,3 +216,20 @@ skipped, zero Pyright errors (214 legacy warnings), successful distribution
 builds, and installed-wheel smoke checks. Version `0.333.0` is a minor bump due
 to observable configuration-validation behavior. The user subsequently requested
 that the complete change be pushed and opened as a PR against `main`.
+
+## Required-check compatibility correction (2026-11-01)
+
+The first PR run passed its reusable jobs, but main's required status context
+remained `lint and test` while the refactor emitted `verify / lint and test`.
+Preserve the required context with a top-level job named exactly `lint and test`.
+It always evaluates the shared verification result and succeeds only for
+`success`; failure, cancellation, and skipped verification cannot produce green.
+The regression test executes the actual workflow gate command for all four
+outcomes and verifies the required name/dependency/expression. Branch protection
+remains intact, and the existing single PR version bump remains `0.333.0`.
+
+Verification: the new regression detects the absent check in the previous
+workflow and passes all four outcomes against the corrected workflow. Eight
+focused CI-reporting tests and actionlint passed. The full local `make ci` gate
+passed with 1,021 tests passed, one skipped, zero Pyright errors, a successful
+package build, and installed-wheel smoke checks.

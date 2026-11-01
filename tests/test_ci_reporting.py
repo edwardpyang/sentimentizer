@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 from coverage import Coverage
 
 SUMMARY_SCRIPT = Path(__file__).resolve().parents[1] / ".github/scripts/coverage_summary.py"
@@ -49,3 +50,22 @@ def test_summary_without_data_does_not_claim_zero_coverage(tmp_path):
         check=True,
     )
     assert result.stdout == ""
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled", "skipped"])
+def test_required_check_passes_only_when_shared_verification_succeeds(outcome):
+    workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yaml"
+    workflow = yaml.safe_load(workflow_path.read_text())
+    gate = workflow["jobs"]["lint-and-test"]
+    assert gate["name"] == "lint and test"
+    assert gate["needs"] == "verify"
+    assert gate["if"] == "${{ always() }}"
+    step = gate["steps"][0]
+    assert step["env"]["VERIFY_RESULT"] == "${{ needs.verify.result }}"
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        env={**os.environ, "VERIFY_RESULT": outcome},
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) == (outcome == "success")

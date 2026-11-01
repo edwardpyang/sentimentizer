@@ -22,3 +22,15 @@ permissions:
 jobs:
   verify:
     uses: ./.github/workflows/verify.yaml
+
+  lint-and-test:
+    # Keep the existing branch-protection context stable across workflow refactors.
+    name: lint and test
+    needs: verify
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+    - name: require successful verification
+      env:
+        VERIFY_RESULT: ${{ needs.verify.result }}
+      run: test "$VERIFY_RESULT" = success
