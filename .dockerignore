@@ -41,4 +41,3 @@ main.go
 k8s/
 metrics/
 scripts/
-workflows/

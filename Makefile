@@ -1,4 +1,4 @@
-.PHONY: setup setup-ci setup-dev download-data train train-rnn train-encoder train-decoder train-modernbert \
+.PHONY: setup setup-ci setup-dev smoke-package download-data train train-rnn train-encoder train-decoder train-modernbert \
        train-distributed train-quick train-no-checkpoint train-resume serve test test-verbose test-lint test-cov lint format check typecheck ci clean docker-build docker-run \
  	   gpu-reset tune tune-rnn tune-encoder tune-decoder tune-standalone \
  	   start-metrics stop-metrics setup-dashboards start-exporter stop-exporter stop-ray \
@@ -310,7 +310,19 @@ ci: check typecheck test
 	rm -rf dist/
 	@echo "==> Verifying package builds successfully..."
 	uv build
+	$(MAKE) smoke-package
 	@echo "==> CI verification passed successfully!"
+
+## Smoke the built wheel in an isolated environment, reusing installed dependencies
+smoke-package:
+	@set -eu; \
+	  smoke_dir=$$(mktemp -d); \
+	  trap 'rm -rf "$$smoke_dir"' EXIT; \
+	  uv venv --python .venv/bin/python "$$smoke_dir/venv"; \
+	  smoke_site=$$("$$smoke_dir/venv/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))'); \
+	  .venv/bin/python -c 'import sysconfig; print(sysconfig.get_path("purelib"))' > "$$smoke_site/dependencies.pth"; \
+	  uv pip install --no-deps --python "$$smoke_dir/venv/bin/python" dist/*.whl; \
+	  "$$smoke_dir/venv/bin/python" scripts/smoke_installed.py
 
 # ──────────────────────────────────────────────
 # Docker

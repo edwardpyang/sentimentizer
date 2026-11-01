@@ -1,7 +1,12 @@
+# Enforce types at schema/config boundaries while legacy modules migrate.
+# pyright: reportArgumentType=error, reportReturnType=error, reportCallIssue=error
+# pyright: reportAttributeAccessIssue=error, reportOptionalMemberAccess=error
+# pyright: reportGeneralTypeIssues=error, reportMissingImports=error
+
 """Configuration for the Ray Serve deployment.
 
 Loads defaults from service.yaml, with environment variables
-taking priority. Use ``ServeConfig.from_yaml()`` to load with the
+taking priority. Use ``load_serve_config()`` to load with the
 standard precedence: YAML defaults < env vars.
 
 Environment variables:
@@ -23,10 +28,13 @@ Environment variables:
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
 import yaml
+from pydantic import ConfigDict, TypeAdapter
 
 from sentimentizer import logger
 
@@ -54,6 +62,8 @@ class ServeConfig:
         bge_m3_num_cpus: Ray CPU reservation per BGE-M3 replica.
         bge_m3_num_gpus: Ray GPU reservation per BGE-M3 replica.
     """
+
+    __pydantic_config__: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     serve_host: str = "0.0.0.0"
     serve_port: int = 8000
@@ -173,7 +183,7 @@ _ENV_OVERRIDES: dict[str, str] = {
 
 # Type coercion for non-string fields
 # list[str] fields use _parse_list for comma-separated env var parsing
-_FIELD_TYPES: dict[str, type | callable] = {
+_FIELD_TYPES: dict[str, Callable[[str], object]] = {
     "serve_port": int,
     "ray_object_store_memory_mb": int,
     "max_batch_size": int,
@@ -241,6 +251,9 @@ def _default_config_path() -> Path:
     return Path(__file__).parent / "service.yaml"
 
 
+_CONFIG_ADAPTER = TypeAdapter(ServeConfig)
+
+
 def load_serve_config(path: str | Path | None = None) -> ServeConfig:
     """Load serve configuration from YAML with environment variable overrides.
 
@@ -269,8 +282,10 @@ def load_serve_config(path: str | Path | None = None) -> ServeConfig:
     # Layer 1: YAML file overrides (if it exists)
     if path.exists():
         with open(path) as f:
-            raw = yaml.safe_load(f) or {}
-        values.update(raw)
+            raw = yaml.safe_load(f)
+        if raw is not None and not isinstance(raw, dict):
+            raise ValueError("Serve configuration must be a YAML mapping")
+        values.update(raw or {})
     stale_yaml_keys = values.keys() & _REMOVED_IMAGE_FIELDS
     for key in stale_yaml_keys:
         del values[key]
@@ -291,7 +306,7 @@ def load_serve_config(path: str | Path | None = None) -> ServeConfig:
                         f"Invalid {env_var}={env_value!r}: expected {coerce.__name__}"
                     ) from None
 
-    return ServeConfig(**values)
+    return _CONFIG_ADAPTER.validate_python(values)
 
 
 # Global singleton instance loaded once at import time

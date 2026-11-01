@@ -1,0 +1,127 @@
+name: verify
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    name: lint and test
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC
+      RAY_DISABLE_IMPORT_WARNING: "1"
+      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+      RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION: "0.5"
+      RAY_TQDM: "0"
+
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - name: set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: install dependencies
+      run: uv sync --locked --extra dev,ray,onnx,router
+
+    - name: ruff format check
+      run: uv run ruff format --check .
+
+    - name: ruff lint
+      run: uv run ruff check .
+
+    - name: pyright typecheck
+      run: uv run pyright
+
+    - name: test with pytest
+      id: tests
+      run: |
+        uv run pytest --exitfirst --verbose --failed-first \
+          --cov --cov-report=term-missing --cov-report=xml --cov-report=html
+
+    - name: publish coverage summary
+      if: ${{ always() && !cancelled() && hashFiles('.coverage') != '' }}
+      env:
+        TEST_OUTCOME: ${{ steps.tests.outcome }}
+      run: |
+        uv run --no-sync python .github/scripts/coverage_summary.py \
+          --test-outcome "$TEST_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: upload coverage reports
+      if: ${{ always() && !cancelled() && hashFiles('coverage.xml') != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: |
+          coverage.xml
+          htmlcov/
+        if-no-files-found: error
+        retention-days: 14
+
+    - name: build and smoke installed wheel
+      run: |
+        uv build
+        make smoke-package
+
+  test-pandas-2:
+    # pyproject allows pandas>=2.2.3, but uv.lock pins 3.x, so the job above
+    # never exercises 2.x. Install the floor over the lockfile and re-run tests.
+    name: test (pandas 2.2.3)
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC
+      RAY_DISABLE_IMPORT_WARNING: "1"
+      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+      RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION: "0.5"
+      RAY_TQDM: "0"
+
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - name: set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: install dependencies
+      run: uv sync --locked --extra dev,ray,onnx,router
+
+    - name: install pandas 2.2.3 over the lockfile
+      run: |
+        uv pip install "pandas==2.2.3"
+        uv run --no-sync python -c "import pandas; assert pandas.__version__ == '2.2.3', pandas.__version__; print('pandas', pandas.__version__)"
+
+    # --no-sync keeps uv run from restoring the locked pandas 3.x.
+    - name: test with pytest
+      run: uv run --no-sync pytest --exitfirst --failed-first
+
+  test-container:
+    name: container smoke
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+    - name: build runtime image
+      run: docker build --tag sentimentizer:ci .
+    - name: smoke installed container outside the source tree
+      run: |
+        docker run --rm --network none --workdir /tmp \
+          --mount "type=bind,src=$PWD/scripts/smoke_installed.py,dst=/tmp/smoke_installed.py,readonly" \
+          --entrypoint python sentimentizer:ci /tmp/smoke_installed.py

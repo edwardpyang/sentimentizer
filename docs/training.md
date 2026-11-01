@@ -80,6 +80,13 @@ sentimentizer train --distributed --num-workers 2 --save
 
 Under the hood, Ray Train orchestrates PyTorch `DistributedDataParallel` (DDP) across the workers. Prometheus metrics are collected from worker rank 0 and published to the metrics endpoints.
 
+Single-node, callback, and Ray worker loops share the same accumulation and
+per-update scheduler implementation. Each epoch starts with a fresh accumulation
+counter. An incomplete final window averages the microbatches it actually saw,
+then performs one optimizer update and one scheduler step. Scheduler budgets
+include this final update using `ceil(num_batches / gradient_accumulation_steps)`.
+DDP continues to synchronize every backward pass.
+
 ---
 
 ## Checkpointing

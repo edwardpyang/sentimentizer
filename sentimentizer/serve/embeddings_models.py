@@ -1,3 +1,8 @@
+# Enforce types at schema/config boundaries while legacy modules migrate.
+# pyright: reportArgumentType=error, reportReturnType=error, reportCallIssue=error
+# pyright: reportAttributeAccessIssue=error, reportOptionalMemberAccess=error
+# pyright: reportGeneralTypeIssues=error, reportMissingImports=error
+
 """Request and response models for embedding endpoints."""
 
 from typing import Annotated, Literal

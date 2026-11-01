@@ -100,9 +100,10 @@ def _record_lr_by_epoch(trainer) -> list[float]:
 
 
 class TestResume:
-    def test_resumed_lr_matches_uninterrupted_schedule(self, tmp_path) -> None:
-        dataset = CorpusDataset(_reviews())
-        cfg = _config(checkpoint_dir=str(tmp_path))
+    @pytest.mark.parametrize("rows,accumulation", [(64, 1), (20, 2)])
+    def test_resumed_lr_matches_uninterrupted_schedule(self, tmp_path, rows, accumulation) -> None:
+        dataset = CorpusDataset(_reviews(rows))
+        cfg = _config(checkpoint_dir=str(tmp_path), gradient_accumulation_steps=accumulation)
 
         model = _tiny_rnn()
         trainer = new_trainer(model, cfg, "rnn")
@@ -476,13 +477,17 @@ def ray_cluster():
 
 
 class TestRealRayRuns:
-    def test_two_worker_training_reports_whole_validation_set(self, ray_cluster, tmp_path) -> None:
-        frame = _reviews(48)
+    @pytest.mark.parametrize("rows,accumulation,updates", [(48, 1, 12), (40, 2, 6)])
+    def test_two_worker_training_reports_whole_validation_set(
+        self, ray_cluster, tmp_path, rows, accumulation, updates
+    ) -> None:
+        frame = _reviews(rows)
         train_ds = ray.data.from_pandas(frame)
         val_ds = ray.data.from_pandas(frame.iloc[:24])
         cfg = _config(
             epochs=2,
             ray_workers=2,
+            gradient_accumulation_steps=accumulation,
             early_stopping_patience=1,
             checkpoint_dir=str(tmp_path / "checkpoints"),
         )
@@ -504,6 +509,9 @@ class TestRealRayRuns:
 
         with best.as_directory() as directory, open(Path(directory) / "data.pkl", "rb") as handle:
             saved = ray.cloudpickle.load(handle)
+        scheduler_state = saved["scheduler_state_dict"]
+        assert scheduler_state["total_steps"] == updates
+        assert scheduler_state["last_epoch"] == saved["epoch"] * (updates // cfg.epochs)
         loaded = RNN.load_from_checkpoint_dir(Path(directory), saved, "cpu")
         assert isinstance(loaded, RNN)
 

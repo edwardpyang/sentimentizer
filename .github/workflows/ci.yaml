@@ -15,106 +15,22 @@ on:
       - 'docs/**'
       - 'LICENSE'
 
-# Both jobs only check out and test; neither needs to write to the repo.
+# Verification only reads repository contents.
 permissions:
   contents: read
 
 jobs:
+  verify:
+    uses: ./.github/workflows/verify.yaml
+
   lint-and-test:
+    # Keep the existing branch-protection context stable across workflow refactors.
     name: lint and test
+    needs: verify
+    if: ${{ always() }}
     runs-on: ubuntu-latest
-    env:
-      TZ: UTC
-      RAY_DISABLE_IMPORT_WARNING: "1"
-      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
-      RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION: "0.5"
-      RAY_TQDM: "0"
-
     steps:
-
-    - uses: actions/checkout@v4
-
-    - name: set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
-
-    - name: install uv
-      uses: astral-sh/setup-uv@v4
-      with:
-        enable-cache: true
-
-    - name: install dependencies
-      run: uv sync --extra dev,ray,onnx,router
-
-    - name: ruff lint
-      run: uv run ruff check .
-
-    - name: ruff format check
-      run: uv run ruff format --check .
-
-    - name: pyright typecheck
-      run: uv run pyright
-
-    - name: test with pytest
-      run: |
-        uv run pytest --exitfirst --verbose --failed-first \
-          --cov --cov-report=term-missing --cov-report=xml --cov-report=html
-
-    - name: publish coverage summary
-      run: |
-        {
-          echo "## Test coverage: $(uv run coverage report --format=total)%"
-          echo
-          echo "Line and branch coverage, least covered files first."
-          echo
-          uv run coverage report --format=markdown --sort=cover --skip-covered
-        } >> "$GITHUB_STEP_SUMMARY"
-
-    - name: upload coverage reports
-      uses: actions/upload-artifact@v4
-      with:
-        name: coverage-report
-        path: |
-          coverage.xml
-          htmlcov/
-        if-no-files-found: error
-        retention-days: 14
-
-  test-pandas-2:
-    # pyproject allows pandas>=2.2.3, but uv.lock pins 3.x, so the job above
-    # never exercises 2.x. Install the floor over the lockfile and re-run tests.
-    name: test (pandas 2.2.3)
-    runs-on: ubuntu-latest
-    env:
-      TZ: UTC
-      RAY_DISABLE_IMPORT_WARNING: "1"
-      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
-      RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION: "0.5"
-      RAY_TQDM: "0"
-
-    steps:
-
-    - uses: actions/checkout@v4
-
-    - name: set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
-
-    - name: install uv
-      uses: astral-sh/setup-uv@v4
-      with:
-        enable-cache: true
-
-    - name: install dependencies
-      run: uv sync --extra dev,ray,onnx,router
-
-    - name: install pandas 2.2.3 over the lockfile
-      run: |
-        uv pip install "pandas==2.2.3"
-        uv run --no-sync python -c "import pandas; assert pandas.__version__ == '2.2.3', pandas.__version__; print('pandas', pandas.__version__)"
-
-    # --no-sync keeps uv run from restoring the locked pandas 3.x.
-    - name: test with pytest
-      run: uv run --no-sync pytest --exitfirst --failed-first
+    - name: require successful verification
+      env:
+        VERIFY_RESULT: ${{ needs.verify.result }}
+      run: test "$VERIFY_RESULT" = success

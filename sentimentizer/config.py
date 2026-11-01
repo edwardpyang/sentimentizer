@@ -1,3 +1,8 @@
+# Enforce types at schema/config boundaries while legacy modules migrate.
+# pyright: reportArgumentType=error, reportReturnType=error, reportCallIssue=error
+# pyright: reportAttributeAccessIssue=error, reportOptionalMemberAccess=error
+# pyright: reportGeneralTypeIssues=error, reportMissingImports=error
+
 import os
 from dataclasses import dataclass
 from logging import INFO

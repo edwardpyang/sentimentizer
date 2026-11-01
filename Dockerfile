@@ -10,6 +10,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.8 /uv /usr/local/bin/uv
 # Copy project files and the resolved dependency graph
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY sentimentizer/ ./sentimentizer/
+COPY workflows/ ./workflows/
 
 # Export exact locked versions for the requested extras. PyTorch is pruned from
 # that export and installed separately from its CPU-only index; otherwise the

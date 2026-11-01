@@ -35,7 +35,11 @@ implementation progresses.
 ## Coverage
 
 - `make test-cov` reports line and branch coverage using the scope in `pyproject.toml`.
-- CI publishes the same numbers to the job summary and a `coverage-report` artifact.
+- CI and publishing reuse `.github/workflows/verify.yaml`, including wheel and
+  container smoke checks outside the source tree.
+- CI publishes the same numbers and missing lines to the job summary and a
+  `coverage-report` artifact. Reporting also runs after test failures when data
+  exists; unsuccessful test runs are explicitly marked partial.
 - Code running in Ray worker processes is not traced, so low numbers in
   `trainer.py::_train_func` and similar paths can understate real coverage. Check whether a
   test exercises the path before treating it as a gap.

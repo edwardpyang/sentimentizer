@@ -1,3 +1,8 @@
+# Enforce types at schema/config boundaries while legacy modules migrate.
+# pyright: reportArgumentType=error, reportReturnType=error, reportCallIssue=error
+# pyright: reportAttributeAccessIssue=error, reportOptionalMemberAccess=error
+# pyright: reportGeneralTypeIssues=error, reportMissingImports=error
+
 """Configuration for the router training pipeline.
 
 Default base model is BAAI/bge-base-en-v1.5 (109M params, 768-dim
