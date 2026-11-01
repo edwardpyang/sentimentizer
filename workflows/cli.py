@@ -8,6 +8,7 @@ handlers to keep ``--help`` fast and avoid pulling in torch/ray.
 
 from __future__ import annotations
 
+import pickle
 from typing import Any
 
 import click
@@ -661,6 +662,19 @@ def router_benchmark(
     click.echo(f"Benchmark report: {Path(output_dir) / 'benchmark_report.json'}")
 
 
+@router.command("convert-head")
+@click.option("--model-path", default="models/router", help="Path to the router artifact")
+def router_convert_head(model_path: str) -> None:
+    """Migrate an artifact's pickled head to the pickle-free format."""
+    from sentimentizer.router.head import convert_pickled_head
+
+    try:
+        target = convert_pickled_head(model_path)
+    except (OSError, TypeError, ValueError, pickle.UnpicklingError) as e:
+        raise click.ClickException(f"Failed to convert router head: {e}") from e
+    click.echo(f"Wrote {target}")
+
+
 @router.command("push")
 @click.option("--model-path", default="models/router", help="Path to trained router model")
 @click.option("--repo-id", default="ryeyoo/sentimentizer-router", help="Hugging Face repository ID")
@@ -675,7 +689,7 @@ def router_push(ctx: click.Context, model_path: str, repo_id: str) -> None:
         model.push_to_hub(repo_id)
         click.echo(f"Successfully pushed router model to {repo_id}")
     except Exception as e:
-        click.echo(f"Failed to push router model: {e}", err=True)
+        raise click.ClickException(f"Failed to push router model: {e}") from e
 
 
 # ── serve ───────────────────────────────────────

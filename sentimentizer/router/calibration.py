@@ -73,6 +73,8 @@ def calibrate_router(
         raise ValueError("Calibration requires training provenance; retrain legacy artifacts first")
     if model.task is None:
         raise ValueError("Calibration requires an artifact with a configured task")
+    if model.provenance.calibration_method is not None:
+        raise ValueError("Artifact is already calibrated; calibrate the uncalibrated artifact")
     if not calibration_records or not policy_records:
         raise ValueError("Calibration and policy datasets must both be nonempty")
     assert_disjoint(calibration_records, policy_records)

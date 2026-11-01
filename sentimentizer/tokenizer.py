@@ -87,6 +87,33 @@ def regex_tokenize(x: str) -> list[str]:
     return pattern.findall(x.lower())
 
 
+def _dictionary_from_counts(
+    word_freq: Counter, doc_freq: Counter, num_docs: int, cfg: TokenizerConfig
+) -> corpora.Dictionary:
+    """Build a filtered, contiguous dictionary from aggregated vocabulary counts."""
+    dictionary = corpora.Dictionary()
+    dictionary.num_docs = num_docs
+
+    # Sort by (descending frequency, ascending word) so the mapping is deterministic
+    # regardless of batch processing order.
+    for idx, word in enumerate(sorted(word_freq.keys(), key=lambda w: (-word_freq[w], w))):
+        dictionary.token2id[word] = idx
+        dictionary.dfs[idx] = doc_freq[word]
+
+    dictionary.num_pos = sum(word_freq.values())
+    dictionary.num_nnz = sum(doc_freq.values())
+
+    dictionary.filter_extremes(
+        no_below=cfg.dict_min,
+        no_above=cfg.no_above,
+        keep_n=cfg.dict_keep,
+    )
+    # Remap IDs to contiguous 0..N-1 after filter_extremes leaves gaps.
+    # Required for embedding matrix row alignment (row k = token ID k-1).
+    dictionary.compactify()
+    return dictionary
+
+
 def new_dictionary(data: pd.DataFrame, cfg: TokenizerConfig) -> corpora.Dictionary:
     """builds a dictionary from a dataframe"""
     # Create dictionary from text column
@@ -107,24 +134,7 @@ def new_dictionary(data: pd.DataFrame, cfg: TokenizerConfig) -> corpora.Dictiona
         word_freq.update(doc_tokens)
         doc_freq.update(set(doc_tokens))
 
-    dictionary = corpora.Dictionary()
-    dictionary.num_docs = num_docs
-
-    for idx, word in enumerate(sorted(word_freq.keys(), key=lambda w: (-word_freq[w], w))):
-        dictionary.token2id[word] = idx
-        dictionary.dfs[idx] = doc_freq[word]
-
-    dictionary.num_pos = sum(word_freq.values())
-    dictionary.num_nnz = sum(doc_freq.values())
-
-    dictionary.filter_extremes(
-        no_below=cfg.dict_min,
-        no_above=cfg.no_above,
-        keep_n=cfg.dict_keep,
-    )
-    # Remap IDs to contiguous 0..N-1 after filter_extremes leaves gaps.
-    # Required for embedding matrix row alignment (row k = token ID k-1).
-    dictionary.compactify()
+    dictionary = _dictionary_from_counts(word_freq, doc_freq, num_docs, cfg)
     logger.info("dictionary created...")
 
     if cfg.save_dictionary:
@@ -165,24 +175,7 @@ class Tokenizer:
             total_doc_freq += df
             total_num_docs += nd
 
-        dictionary = corpora.Dictionary()
-        dictionary.num_docs = total_num_docs
-
-        for idx, word in enumerate(
-            sorted(total_word_freq.keys(), key=lambda w: (-total_word_freq[w], w))
-        ):
-            dictionary.token2id[word] = idx
-            dictionary.dfs[idx] = total_doc_freq[word]
-
-        dictionary.num_pos = sum(total_word_freq.values())
-        dictionary.num_nnz = sum(total_doc_freq.values())
-
-        dictionary.filter_extremes(
-            no_below=cfg.dict_min,
-            no_above=cfg.no_above,
-            keep_n=cfg.dict_keep,
-        )
-        dictionary.compactify()
+        dictionary = _dictionary_from_counts(total_word_freq, total_doc_freq, total_num_docs, cfg)
 
         if cfg.save_dictionary:
             dictionary.save(str(FileConfig.dictionary_file_path))
@@ -479,31 +472,7 @@ def _build_dictionary_distributed(ds: ray.data.Dataset, cfg: TokenizerConfig) ->
         total_num_docs += nd
 
     # Reduce phase: build Gensim dictionary from aggregated counts
-    dictionary = corpora.Dictionary()
-    dictionary.num_docs = total_num_docs
-
-    # Assign contiguous IDs to all words.
-    # Sort by (descending frequency, ascending word) so the dictionary is
-    # deterministic regardless of batch processing order.  This guarantees
-    # the same token-to-ID mapping on every run.
-    for idx, word in enumerate(
-        sorted(total_word_freq.keys(), key=lambda w: (-total_word_freq[w], w))
-    ):
-        dictionary.token2id[word] = idx
-        dictionary.dfs[idx] = total_doc_freq[word]
-
-    # num_pos = total word count (used by filter_extremes)
-    dictionary.num_pos = sum(total_word_freq.values())
-    dictionary.num_nnz = sum(total_doc_freq.values())
-
-    dictionary.filter_extremes(
-        no_below=cfg.dict_min,
-        no_above=cfg.no_above,
-        keep_n=cfg.dict_keep,
-    )
-    # Remap IDs to contiguous 0..N-1 after filter_extremes leaves gaps.
-    # Required for embedding matrix row alignment (row k = token ID k-1).
-    dictionary.compactify()
+    dictionary = _dictionary_from_counts(total_word_freq, total_doc_freq, total_num_docs, cfg)
     logger.info(
         f"dictionary created via Map-Reduce: {len(dictionary)} terms, {total_num_docs} documents"
     )

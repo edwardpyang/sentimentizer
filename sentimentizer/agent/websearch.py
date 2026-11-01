@@ -49,6 +49,9 @@ DEFAULT_API_URL = "https://ollama.com/api/web_search"
 DEFAULT_MAX_RESULTS = 5
 DEFAULT_MAX_QUERY_LENGTH = 200
 DEFAULT_MAX_CONTENT_LENGTH = 2000
+MAX_TITLE_LENGTH = 300
+MAX_URL_LENGTH = 2048
+MAX_RESULTS_LIMIT = 10
 DEFAULT_TIMEOUT_SECONDS = 15
 MAX_CALLS_PER_RUN = 3
 
@@ -240,11 +243,15 @@ def web_search(
         List of ``WebSearchResult`` objects with title, url, and content.
 
     Raises:
-        ValueError: If the query is invalid or contains secrets.
+        ValueError: If the query is invalid or contains secrets, or the API
+            response does not have the expected shape.
         RuntimeError: If the rate limit is exceeded.
         OSError: If ``OLLAMA_API_KEY`` is not set.
         urllib.error.URLError: If the API request fails.
     """
+    if not 1 <= max_results <= MAX_RESULTS_LIMIT:
+        raise ValueError(f"max_results must be between 1 and {MAX_RESULTS_LIMIT}")
+
     # Validate query
     validated_query = validate_query(query, max_length=max_query_length)
 
@@ -302,19 +309,24 @@ def web_search(
         raise ValueError(f"Failed to parse web search response: {e}") from e
 
     # Extract results
-    raw_results = data.get("results", [])
+    raw_results = data.get("results", []) if isinstance(data, dict) else None
+    if not isinstance(raw_results, list) or not all(isinstance(r, dict) for r in raw_results):
+        logger.warning("web_search_unexpected_response")
+        raise ValueError("Web search response did not contain a list of results")
     if not raw_results:
         logger.info("web_search_no_results", query=validated_query)
         return []
 
-    # Build sanitized results
+    # Every field reaches the LLM, so all of them are untrusted.
     results: list[WebSearchResult] = []
     for item in raw_results[:max_results]:
         results.append(
             WebSearchResult(
-                title=item.get("title", ""),
-                url=item.get("url", ""),
-                content=sanitize_content(item.get("content", ""), max_length=max_content_length),
+                title=sanitize_content(str(item.get("title") or ""), max_length=MAX_TITLE_LENGTH),
+                url=sanitize_content(str(item.get("url") or ""), max_length=MAX_URL_LENGTH),
+                content=sanitize_content(
+                    str(item.get("content") or ""), max_length=max_content_length
+                ),
             )
         )
 
@@ -514,8 +526,8 @@ def main(argv: list[str] | None = None) -> int:
     reset_rate_limit()
 
     # Validate max_results range
-    if not 1 <= args.max_results <= 10:
-        print("Error: --max-results must be between 1 and 10.", file=sys.stderr)
+    if not 1 <= args.max_results <= MAX_RESULTS_LIMIT:
+        print(f"Error: --max-results must be between 1 and {MAX_RESULTS_LIMIT}.", file=sys.stderr)
         return 1
 
     try:

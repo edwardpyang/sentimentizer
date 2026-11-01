@@ -3623,7 +3623,7 @@ wheels = [
 
 [[package]]
 name = "sentimentizer"
-version = "0.331.0"
+version = "0.332.0"
 source = { editable = "." }
 dependencies = [
     { name = "bitsandbytes" },
@@ -3679,6 +3679,7 @@ ray = [
 router = [
     { name = "datasets" },
     { name = "requests" },
+    { name = "safetensors" },
     { name = "sentence-transformers" },
 ]
 
@@ -3730,6 +3731,7 @@ requires-dist = [
     { name = "requests", marker = "extra == 'router'" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.0" },
+    { name = "safetensors", marker = "extra == 'router'", specifier = ">=0.4.3" },
     { name = "scikit-learn", specifier = ">=1.8.0" },
     { name = "scipy", specifier = ">=1.10.0" },
     { name = "sentence-transformers", marker = "extra == 'embeddings'", specifier = ">=4.0.0" },

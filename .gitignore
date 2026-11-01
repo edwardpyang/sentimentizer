@@ -48,6 +48,9 @@ checkpoints/
 .bsp/
 *.egg-info/
 .coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # ONNX export artifacts
 onnx_artifacts/

@@ -21,6 +21,13 @@ from typing import Any
 
 import numpy as np
 
+from sentimentizer.router.head import (
+    HEAD_FILENAME,
+    PICKLED_HEAD_FILENAMES,
+    PICKLED_HEAD_PATTERNS,
+    load_head,
+    save_head,
+)
 from sentimentizer.router.schemas import (
     RouterAcceptancePolicy,
     RouterArtifactMetadata,
@@ -34,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 # Lazy imports — these are optional dependencies
 _sentence_transformers: Any = None
-_joblib: Any = None
 
 
 class RouterPolicyUnavailableError(RuntimeError):
@@ -49,16 +55,6 @@ def _get_sentence_transformers() -> Any:
 
         _sentence_transformers = SentenceTransformer
     return _sentence_transformers
-
-
-def _get_joblib() -> Any:
-    """Lazy import joblib."""
-    global _joblib
-    if _joblib is None:
-        import joblib
-
-        _joblib = joblib
-    return _joblib
 
 
 class RouterModel:
@@ -125,11 +121,10 @@ class RouterModel:
 
         Expects the directory to contain:
         - SentenceTransformer backbone files (model.safetensors, config.json, etc.)
-        - router_head.joblib (serialized sklearn classifier)
+        - router_head.safetensors (classifier parameters; see ``router.head``)
         - router_config.json (metadata with labels, model_type, etc.)
 
-        Falls back to legacy SetFit model loading if router_head.joblib
-        is not found (for backward compatibility with previously saved models).
+        Pickled heads are never loaded, because that would run code from the artifact.
 
         Args:
             path: Path to the saved model directory.
@@ -139,30 +134,31 @@ class RouterModel:
 
         Raises:
             FileNotFoundError: If the path doesn't exist.
-            RuntimeError: If the model cannot be loaded.
+            RuntimeError: If the artifact has no pickle-free head.
+            ValueError: If the head or metadata is invalid.
         """
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Model path not found: {path}")
 
         metadata = cls.read_metadata(path) or RouterArtifactMetadata()
+
+        head_path = path / HEAD_FILENAME
+        if not head_path.exists():
+            if any((path / name).exists() for name in PICKLED_HEAD_FILENAMES):
+                raise RuntimeError(
+                    f"Router artifact at {path} has a pickled head, which is no longer "
+                    f"loaded. Run: sentimentizer router convert-head --model-path {path}"
+                )
+            raise RuntimeError(f"Router artifact at {path} has no {HEAD_FILENAME}")
+        logger.info(f"Loading classification head from {head_path}")
+        head = load_head(head_path)
+
         SentenceTransformer = _get_sentence_transformers()
-        joblib = _get_joblib()
 
         # Load backbone
         logger.info(f"Loading backbone from {path}")
         backbone = SentenceTransformer(str(path))
-
-        # Load head
-        head_path = path / "router_head.joblib"
-        if head_path.exists():
-            logger.info(f"Loading classification head from {head_path}")
-            head = joblib.load(head_path)
-        else:
-            logger.warning(
-                f"No router_head.joblib found at {path}. Attempting legacy SetFit model migration."
-            )
-            return cls._migrate_legacy_setfit_model(path, backbone)
 
         return cls(
             backbone=backbone,
@@ -173,49 +169,6 @@ class RouterModel:
             acceptance_policy=metadata.acceptance_policy,
         )
 
-    @classmethod
-    def _migrate_legacy_setfit_model(cls, path: Path, backbone: Any) -> RouterModel:
-        """Migrate a legacy SetFit-format model to RouterModel.
-
-        Legacy SetFit models store the head as model_head.pkl and
-        labels in config_setfit.json. This method loads those files
-        and returns a RouterModel without the setfit dependency.
-
-        Args:
-            path: Path to the SetFit model directory.
-            backbone: Already-loaded SentenceTransformer backbone.
-
-        Returns:
-            RouterModel with migrated head and labels.
-
-        Raises:
-            RuntimeError: If migration fails.
-        """
-        joblib = _get_joblib()
-
-        # Try loading SetFit's head format (model_head.pkl or model_head.pickle)
-        head = None
-        for head_name in ("model_head.pkl", "model_head.pickle"):
-            head_path = path / head_name
-            if head_path.exists():
-                try:
-                    head = joblib.load(head_path)
-                    logger.info(f"Migrated SetFit head from {head_path}")
-                    break
-                except Exception as e:
-                    logger.warning(f"Failed to load SetFit head from {head_path}: {e}")
-
-        metadata = cls.read_metadata(path) or RouterArtifactMetadata()
-
-        if head is None:
-            raise RuntimeError(
-                f"Cannot migrate SetFit model at {path}: "
-                f"no model_head.pkl or model_head.pickle found. "
-                f"Please retrain the router model using the updated training pipeline."
-            )
-
-        return cls(backbone=backbone, head=head, labels=metadata.labels, task=metadata.task)
-
     # ------------------------------------------------------------------
     # Save / push
     # ------------------------------------------------------------------
@@ -225,16 +178,17 @@ class RouterModel:
 
         Saves:
         - SentenceTransformer backbone files
-        - router_head.joblib (serialized sklearn classifier)
+        - router_head.safetensors (classifier parameters; see ``router.head``)
         - router_config.json (metadata)
 
         Args:
             path: Directory to save the model to.
+
+        Raises:
+            UnsupportedRouterHeadError: If the head cannot be stored without pickle.
         """
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-
-        joblib = _get_joblib()
 
         # Save backbone
         logger.info(f"Saving backbone to {path}")
@@ -242,8 +196,8 @@ class RouterModel:
 
         # Save head
         if self.head is not None:
-            head_path = path / "router_head.joblib"
-            joblib.dump(self.head, head_path)
+            head_path = path / HEAD_FILENAME
+            save_head(self.head, head_path)
             logger.info(f"Saved classification head to {head_path}")
 
         # Save config
@@ -274,6 +228,8 @@ class RouterModel:
         Args:
             repo_id: Hugging Face repository ID (e.g., "user/model").
             **kwargs: Additional arguments passed to huggingface_hub.
+                Older pickled heads are deleted from the repo unless
+                ``delete_patterns`` is given.
         """
         import tempfile
 
@@ -282,6 +238,7 @@ class RouterModel:
         with tempfile.TemporaryDirectory() as tmp_dir:
             self.save_pretrained(tmp_dir)
             api = HfApi()
+            kwargs.setdefault("delete_patterns", list(PICKLED_HEAD_PATTERNS))
             api.upload_folder(
                 folder_path=tmp_dir,
                 repo_id=repo_id,

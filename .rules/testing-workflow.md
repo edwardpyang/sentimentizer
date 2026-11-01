@@ -19,3 +19,23 @@ implementation progresses.
 - **Reporting**: When you communicate with the user that a step is completed,
   mention that you have successfully ran the checks and that the codebase
   remains in a healthy state.
+
+## Regression tests
+
+- **Every bug fix includes a regression test.** Watch it fail against the old behavior when
+  practical, and name the behavior rather than the ticket or the fix.
+- **Test the real entry point.** Call the actual handler, stage, or graph function. A test
+  helper that reimplements a handler verifies the copy, and it keeps passing after the real
+  code breaks. Mock the boundaries (network, models, Ray), not the code under test.
+- **Cover the failure path.** Include malformed input, interrupted work, and degraded
+  dependencies, and assert on what is left behind: no partial file, previous file intact,
+  error type, status code, and exit behavior.
+- Do not add tests that only execute lines to raise a percentage. Assert on behavior.
+
+## Coverage
+
+- `make test-cov` reports line and branch coverage using the scope in `pyproject.toml`.
+- CI publishes the same numbers to the job summary and a `coverage-report` artifact.
+- Code running in Ray worker processes is not traced, so low numbers in
+  `trainer.py::_train_func` and similar paths can understate real coverage. Check whether a
+  test exercises the path before treating it as a gap.

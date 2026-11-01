@@ -16,7 +16,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from sentimentizer.config import VALID_DEVICES, OptimizationParams, SchedulerParams
+from sentimentizer.config import (
+    VALID_DEVICES,
+    ModernBERTConfig,
+    OptimizationParams,
+    SchedulerParams,
+)
 
 if TYPE_CHECKING:
     from sentimentizer.tokenizer import Tokenizer
@@ -189,7 +194,7 @@ class BaseSentimentModel(nn.Module):
                 text,
                 padding=False,
                 truncation=True,
-                max_length=512,
+                max_length=ModernBERTConfig.max_seq_length,
                 return_tensors="pt",
             )
             inputs = {k: v for k, v in encoded.items()}
@@ -287,8 +292,8 @@ def get_trained_model(model_type: str, device: str) -> nn.Module:
             raise FileNotFoundError(
                 f"Weights file not found at {weights_path} and could not be "
                 "downloaded from Hugging Face Hub. Please train the model "
-                f"first: python workflows/driver.py --device cuda --model {model_type} "
-                "--type new --save True"
+                f"first: sentimentizer --model {model_type} --device auto --run-type new "
+                "run --save"
             )
 
     checkpoint = torch.load(

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import shutil
 import tempfile
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -54,19 +57,36 @@ _BACKBONE_FILENAMES = [
     "vocab.txt",
     "tokenizer.model",
 ]
+_REQUIRED_BACKBONE_FILENAMES = {"config.json", "model.safetensors"}
+
+
+def _copy_atomic(source: str | Path, destination: Path) -> None:
+    """Copy a file so an interrupted copy never looks like a complete download."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = destination.with_name(f".{destination.name}.partial")
+    try:
+        shutil.copy2(source, temporary_path)
+        temporary_path.replace(destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _download_backbone_dir(repo_id: str, local_backbone_dir: Path, model_type: str) -> None:
     """Download the backbone directory from the Hugging Face Hub.
 
     Downloads all known HuggingFace backbone files (``backbone/*``) to
-    *local_backbone_dir*.  Missing files are skipped silently since not
-    every model ships every file.
+    *local_backbone_dir*.  Optional files absent from the repo are skipped since
+    not every model ships every file.
 
     Args:
         repo_id: Hugging Face repository ID.
         local_backbone_dir: Local directory to write backbone files into.
         model_type: Model type string (for log messages).
+
+    Raises:
+        FileNotFoundError: If a required backbone file is absent from the repo.
+        Exception: Any non-"not found" download failure propagates, because a
+            partial backbone fails later with a far less useful error.
     """
     local_backbone_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Downloading backbone directory from {repo_id}/backbone/ ...")
@@ -78,14 +98,14 @@ def _download_backbone_dir(repo_id: str, local_backbone_dir: Path, model_type: s
                 repo_id=repo_id,
                 filename=remote_path,
             )
-            import shutil
-
-            shutil.copy2(downloaded, local_backbone_dir / filename)
+            _copy_atomic(downloaded, local_backbone_dir / filename)
             logger.info(f"  Downloaded {filename} -> {local_backbone_dir / filename}")
-        except EntryNotFoundError:
+        except EntryNotFoundError as exc:
+            if filename in _REQUIRED_BACKBONE_FILENAMES:
+                raise FileNotFoundError(
+                    f"Required backbone file {filename} not found in {repo_id}"
+                ) from exc
             logger.debug(f"  Skipped {filename} (not found in repo)")
-        except Exception as e:
-            logger.warning(f"  Failed to download {filename}: {e}")
 
     logger.info(f"Backbone directory downloaded to {local_backbone_dir}")
 
@@ -253,8 +273,6 @@ def _format_metrics_section(tuning_result: dict[str, Any]) -> str:
     best_config = tuning_result.get("best_config")
     if best_config and isinstance(best_config, dict):
         config_lines = ["\n<details><summary>Best Configuration</summary>\n", "```json"]
-        import json
-
         config_lines.append(json.dumps(best_config, indent=2))
         config_lines.append("```\n</details>\n")
         lines.extend(config_lines)
@@ -372,10 +390,13 @@ def _upload_backbone_dir(api: HfApi, backbone_dir: Path, repo_id: str, model_typ
         backbone_dir: Local path to the backbone directory (must exist).
         repo_id: Hugging Face repository ID.
         model_type: Model type string (for commit messages).
+
+    Raises:
+        FileNotFoundError: If *backbone_dir* does not exist, since weights without
+            their backbone cannot be loaded.
     """
     if not backbone_dir.is_dir():
-        logger.error(f"Backbone directory not found: {backbone_dir}")
-        return
+        raise FileNotFoundError(f"Backbone directory not found: {backbone_dir}")
 
     logger.info(f"Pushing backbone directory to Hugging Face Hub: {repo_id}/backbone/...")
     for file_path in sorted(backbone_dir.iterdir()):
@@ -391,6 +412,47 @@ def _upload_backbone_dir(api: HfApi, backbone_dir: Path, repo_id: str, model_typ
     logger.info(f"Successfully pushed backbone directory to {repo_id}/backbone/")
 
 
+def _upload_model_artifacts(
+    api: HfApi,
+    *,
+    weights_path: Path,
+    model_type: str,
+    repo_id: str,
+    dict_path: str | Path | None,
+    tuning_result: dict[str, Any] | None,
+    backbone_path: str | Path | None,
+) -> None:
+    """Upload weights, the HF backbone or dictionary, and the model card."""
+    filename = f"{model_type}_weights.pth"
+    api.upload_file(
+        path_or_fileobj=str(weights_path),
+        path_in_repo=filename,
+        repo_id=repo_id,
+        commit_message=f"Update {model_type} weights",
+    )
+    logger.info(f"Successfully pushed weights to {repo_id}/{filename}")
+
+    if model_type in _HF_MODEL_TYPES:
+        backbone = Path(backbone_path) if backbone_path is not None else None
+        _upload_backbone_dir(api, backbone or weights_path.parent / "backbone", repo_id, model_type)
+
+    if dict_path is not None:
+        dict_file = Path(dict_path)
+        if dict_file.exists():
+            logger.info(f"Pushing dictionary to Hugging Face Hub: {repo_id}...")
+            api.upload_file(
+                path_or_fileobj=str(dict_file),
+                path_in_repo=dict_file.name,
+                repo_id=repo_id,
+                commit_message=f"Update dictionary for {model_type}",
+            )
+            logger.info(f"Successfully pushed dictionary to {repo_id}/{dict_file.name}")
+        else:
+            logger.error(f"Dictionary file not found: {dict_file}")
+
+    _upload_model_card(api, repo_id, model_type, tuning_result)
+
+
 def push_model_to_hub(
     local_path: str | Path,
     model_type: str,
@@ -398,7 +460,7 @@ def push_model_to_hub(
     dict_path: str | Path | None = None,
     tuning_result: dict[str, Any] | None = None,
     backbone_path: str | Path | None = None,
-) -> None:
+) -> bool:
     """Upload model weights, dictionary, and model card to the Hugging Face Hub.
 
     If *repo_id* is provided, it uploads to that repository.
@@ -419,97 +481,51 @@ def push_model_to_hub(
         backbone_path: Optional path to the backbone directory (for HF models).
             If not provided and the model type is an HF model, defaults to
             ``<local_path_parent>/backbone/``.
+
+    Returns:
+        True if the weights and required artifacts were uploaded, False otherwise.
     """
     if repo_id is None:
         repo_id = HF_WEIGHTS_REPOS.get(model_type)
 
     if repo_id is None:
         logger.error(f"No Hugging Face repo configured for model type {model_type!r}")
-        return
+        return False
 
     path = Path(local_path)
     if not path.exists():
         logger.error(f"Local weight file not found: {path}")
-        return
+        return False
 
-    is_hf_model = model_type in _HF_MODEL_TYPES
-    filename = f"{model_type}_weights.pth"
     api = HfApi()
+    upload = partial(
+        _upload_model_artifacts,
+        api,
+        weights_path=path,
+        model_type=model_type,
+        repo_id=repo_id,
+        dict_path=dict_path,
+        tuning_result=tuning_result,
+        backbone_path=backbone_path,
+    )
 
-    logger.info(f"Pushing {filename} to Hugging Face Hub: {repo_id}...")
+    logger.info(f"Pushing {model_type}_weights.pth to Hugging Face Hub: {repo_id}...")
     try:
-        api.upload_file(
-            path_or_fileobj=str(path),
-            path_in_repo=filename,
-            repo_id=repo_id,
-            commit_message=f"Update {model_type} weights",
-        )
-        logger.info(f"Successfully pushed weights to {repo_id}/{filename}")
-
-        if is_hf_model:
-            bdir = Path(backbone_path) if backbone_path is not None else path.parent / "backbone"
-            _upload_backbone_dir(api, bdir, repo_id, model_type)
-
-        if dict_path is not None:
-            dict_file = Path(dict_path)
-            if dict_file.exists():
-                logger.info(f"Pushing dictionary to Hugging Face Hub: {repo_id}...")
-                api.upload_file(
-                    path_or_fileobj=str(dict_file),
-                    path_in_repo=dict_file.name,
-                    repo_id=repo_id,
-                    commit_message=f"Update dictionary for {model_type}",
-                )
-                logger.info(f"Successfully pushed dictionary to {repo_id}/{dict_file.name}")
-            else:
-                logger.error(f"Dictionary file not found: {dict_file}")
-
-        # Upload model card (README.md) with tuning metrics
-        _upload_model_card(api, repo_id, model_type, tuning_result)
-
+        upload()
+        return True
     except Exception as e:
-        # Check if error is because repo doesn't exist
-        if "Repository Not Found" in str(e) or "404 Client Error" in str(e):
-            logger.info(f"Repository {repo_id} not found. Attempting to create it...")
-            try:
-                api.create_repo(repo_id=repo_id, exist_ok=True)
-                # Retry upload after creation
-                api.upload_file(
-                    path_or_fileobj=str(path),
-                    path_in_repo=filename,
-                    repo_id=repo_id,
-                    commit_message=f"Initial {model_type} weights upload",
-                )
-                logger.info(f"Successfully created repo and pushed weights to {repo_id}/{filename}")
+        if "Repository Not Found" not in str(e) and "404 Client Error" not in str(e):
+            logger.error(f"Failed to push weights to Hugging Face Hub: {e}")
+            return False
 
-                if is_hf_model:
-                    bdir = (
-                        Path(backbone_path)
-                        if backbone_path is not None
-                        else path.parent / "backbone"
-                    )
-                    _upload_backbone_dir(api, bdir, repo_id, model_type)
-
-                if dict_path is not None:
-                    dict_file = Path(dict_path)
-                    if dict_file.exists():
-                        api.upload_file(
-                            path_or_fileobj=str(dict_file),
-                            path_in_repo=dict_file.name,
-                            repo_id=repo_id,
-                            commit_message=f"Initial dictionary upload for {model_type}",
-                        )
-                        logger.info(f"Successfully pushed dictionary to {repo_id}/{dict_file.name}")
-
-                # Upload model card after creating new repo
-                _upload_model_card(api, repo_id, model_type, tuning_result)
-
-                return
-            except Exception as create_error:
-                logger.error(f"Failed to create repository or retry upload: {create_error}")
-                return
-
-        logger.error(f"Failed to push weights to Hugging Face Hub: {e}")
+    logger.info(f"Repository {repo_id} not found. Attempting to create it...")
+    try:
+        api.create_repo(repo_id=repo_id, exist_ok=True)
+        upload()
+        return True
+    except Exception as create_error:
+        logger.error(f"Failed to create repository or retry upload: {create_error}")
+        return False
 
 
 def pull_model_from_hub(
@@ -532,56 +548,7 @@ def pull_model_from_hub(
     Returns:
         True if the weight download was successful, False otherwise.
     """
-    filename = f"{model_type}_weights.pth"
-    local_path = Path(local_path)
-    is_hf_model = model_type in _HF_MODEL_TYPES
-
-    logger.info(f"Pulling {filename} from Hugging Face Hub: {repo_id}...")
-    try:
-        downloaded_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-        )
-
-        # Ensure target directory exists
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Move the downloaded file to the expected local path
-        import shutil
-
-        shutil.copy(downloaded_path, local_path)
-
-        logger.info(f"Successfully pulled weights to {local_path}")
-
-        if is_hf_model:
-            backbone_dir = local_path.parent / "backbone"
-            _download_backbone_dir(repo_id, backbone_dir, model_type)
-
-        if dict_path is not None:
-            dict_file = Path(dict_path)
-            try:
-                logger.info(f"Pulling dictionary from Hugging Face Hub: {repo_id}...")
-                downloaded_dict = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=dict_file.name,
-                )
-                dict_file.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy(downloaded_dict, dict_file)
-                logger.info(f"Successfully pulled dictionary to {dict_file}")
-            except EntryNotFoundError:
-                logger.warning(
-                    f"Dictionary file {dict_file.name} not found in repository {repo_id}"
-                )
-            except Exception as e:
-                logger.error(f"Failed to pull dictionary from Hugging Face Hub: {e}")
-
-        return True
-    except EntryNotFoundError:
-        logger.warning(f"Weights file {filename} not found in repository {repo_id}")
-        return False
-    except Exception as e:
-        logger.error(f"Failed to pull weights from Hugging Face Hub: {e}")
-        return False
+    return download_weights(model_type, local_path, repo_id, dict_path) is not None
 
 
 def download_weights(
@@ -626,18 +593,14 @@ def download_weights(
             filename=filename,
         )
 
-        # Ensure target directory exists
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Copy the downloaded file to the expected local path
-        import shutil
-
-        shutil.copy2(downloaded_path, local_path)
-        logger.info(f"Weights downloaded to {local_path}")
-
+        # Weights go last: callers treat the weights file as proof the download is
+        # complete, and skip downloading if it exists.
         if is_hf_model:
             backbone_dir = local_path.parent / "backbone"
             _download_backbone_dir(repo_id, backbone_dir, model_type)
+
+        _copy_atomic(downloaded_path, local_path)
+        logger.info(f"Weights downloaded to {local_path}")
 
         if dict_path is not None:
             dict_file = Path(dict_path)
@@ -647,8 +610,7 @@ def download_weights(
                     repo_id=repo_id,
                     filename=dict_file.name,
                 )
-                dict_file.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(downloaded_dict, dict_file)
+                _copy_atomic(downloaded_dict, dict_file)
                 logger.info(f"Dictionary downloaded to {dict_file}")
             except EntryNotFoundError:
                 logger.warning(f"Dictionary file {dict_file.name} not found in {repo_id}")

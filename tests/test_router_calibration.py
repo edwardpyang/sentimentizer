@@ -351,3 +351,12 @@ def test_training_cli_persists_optional_group_ids_and_rejects_later_overlap(tmp_
         evaluate_router(
             restored, [{"text": "6 another source A snippet", "label": 1, "group_id": "review-A"}]
         )
+
+
+def test_calibrating_a_calibrated_artifact_is_rejected():
+    """The stored format holds one sigmoid layer, so stacking must fail early, not at save."""
+    calibrated = calibrate_router(
+        tiny_router(), records("calibration"), records("policy"), min_accuracy=1.0, min_accepted=2
+    )
+    with pytest.raises(ValueError, match="already calibrated"):
+        calibrate_router(calibrated, records("calibration"), records("policy"))

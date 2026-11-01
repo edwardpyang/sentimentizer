@@ -210,6 +210,36 @@ make upload-router
 sentimentizer router push --model-path models/router --repo-id your-username/sentimentizer-router
 ```
 
+Serving only auto-downloads the commit pinned by `HF_ROUTER_REVISION` in
+`sentimentizer/config.py`. After pushing a new default artifact, set that constant to the new
+commit hash, or deployments keep using the previous one.
+
+### Head format
+
+The head is stored in `router_head.safetensors`, which holds numbers and cannot run code when
+loaded. It can represent a `LogisticRegression`, optionally with sigmoid calibration; saving
+anything else fails. Calibrate an uncalibrated artifact; calibrating twice is rejected.
+
+Serving never loads pickled heads. An artifact with only `router_head.joblib` or
+`model_head.pkl` fails with an error until it is converted:
+
+```bash
+sentimentizer router convert-head --model-path models/router
+```
+
+Conversion uses an unpickler that can only build the expected scikit-learn and numpy classes,
+and checks that the new file gives the same probabilities. It rejects anything else.
+
+`make upload-router` deletes old pickles from the repo, so a retrained backbone never sits
+beside a stale head. Package versions up to 0.331 download the repo's latest commit and need
+that pickle, and they fail once it is gone. To migrate the same model without breaking them,
+upload only the new file, then pin the resulting commit:
+
+```bash
+hf upload ryeyoo/sentimentizer-router \
+  models/router/router_head.safetensors router_head.safetensors
+```
+
 Run the whole pipeline (split → augment → train → evaluate) with `make router-pipeline`.
 
 The Makefile pipeline now requires labeled original sources at

@@ -24,6 +24,10 @@ implementing:
 | Tuning knobs or model-call constants | `.rules/prompts-and-constants.md` |
 | Logging, timeouts, or long-running work | `.rules/observability.md` |
 | A feature plan or multi-milestone implementation | `.rules/plan-review.md`, `.rules/testing-workflow.md` |
+| Any bug fix or new behavior | `.rules/testing-workflow.md` |
+| Web results, LLM input, request headers, downloaded artifacts | `.rules/untrusted-input.md` |
+| Files other code reads, downloads, CLI or stage failure paths | `.rules/durable-state-and-failures.md` |
+| Opening or updating a pull request | `.rules/versioning.md` |
 
 ## Task routing
 
@@ -31,6 +35,8 @@ implementing:
 |---|---|
 | Plan a feature, refactor, or architectural change | `.skills/plan-feature/SKILL.md` |
 | Change threads, locks, shared state, Ray processes, lazy construction, shutdown | `.skills/change-concurrent-code-safely/SKILL.md` |
+| Review the codebase or a module for defects and coverage gaps | `.skills/review-and-harden/SKILL.md` |
+| Open a pull request (version bump, verification, push) | `.skills/ship-pull-request/SKILL.md` |
 | Runtime failures, zero negative accuracy, GloVe mismatch, scheduler issues | `docs/troubleshooting.md` |
 | Metric definitions, gauges, stale-metric behavior | `docs/metrics.md` |
 | Config dataclasses and env vars | `docs/configuration.md` |
@@ -43,6 +49,13 @@ implementing:
 `docs/*_plan.md` files are historical design context, not current behavior.
 Treat the code as the source of truth when they disagree.
 
+## Pull requests
+
+**Every pull request bumps the semantic version in `pyproject.toml` and `uv.lock`, and the
+branch is pushed after the bump.** Run `uv version --bump <patch|minor|major> --no-sync`, then
+`make ci`, commit, and push. See `.rules/versioning.md` for choosing the level.
+Merging a version change to `main` publishes to PyPI (`.github/workflows/publish.yaml`).
+
 ## Verification
 
 **`make ci` is the completion gate for any code change.** It runs
@@ -54,6 +67,7 @@ make ci        # full local mirror of CI — run before pushing
 make check     # format + autofix + lint only (fast inner loop)
 make typecheck # pyright
 make test      # pytest tests/
+make test-cov  # pytest with line and branch coverage
 ```
 
 Rules:
@@ -69,6 +83,8 @@ Rules:
 - Run verification **only when code changed**. Documentation- and
   markdown-only changes do not need the suite.
 - pyright reports warnings that do not fail the build; only `error` counts.
+- CI publishes coverage to the run's job summary and a `coverage-report` artifact
+  (`coverage.xml`, `htmlcov/`). It is report-only: there is no `fail_under` gate.
 
 ## Architecture
 
@@ -506,6 +522,10 @@ required after any dashboard change.
 - Pipeline: `make router-augment` → `make router-train` → `make router-evaluate`;
   `make upload-router` pushes to the Hub.
 - Router ONNX export is deferred to v2 — the router runs Python inference.
+- **The head is stored without pickle** (`router/head.py`, `router_head.safetensors`).
+  `from_pretrained` never loads pickles; older artifacts migrate through
+  `sentimentizer router convert-head`, which uses an allowlisted unpickler. New head types
+  must be added to that format, not stored with joblib.
 
 ## Ray 2.55 API Conventions
 

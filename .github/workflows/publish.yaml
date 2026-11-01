@@ -9,8 +9,8 @@ on:
     paths:
       - 'pyproject.toml'
 
+# Only the publish job needs OIDC; it requests id-token itself.
 permissions:
-  id-token: write
   contents: read
 
 jobs:
