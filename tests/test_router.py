@@ -511,7 +511,7 @@ class TestRouterModel:
         model.save_pretrained(str(save_dir))
 
         # Verify files exist
-        assert (save_dir / "router_head.joblib").exists()
+        assert (save_dir / "router_head.safetensors").exists()
         assert (save_dir / "router_config.json").exists()
 
         # Verify config content

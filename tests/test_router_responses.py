@@ -27,6 +27,12 @@ def make_router(labels=("first", "second"), classes=(0, 1), probabilities=None):
     return RouterModel(backbone, head, task=task)
 
 
+def _fitted_head():
+    from sklearn.linear_model import LogisticRegression
+
+    return LogisticRegression().fit(np.array([[1, 0, 0, 0], [0, 1, 0, 0]] * 2), [0, 1, 0, 1])
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -159,10 +165,7 @@ def test_explicit_conflicting_model_labels_fail():
 
 def test_task_artifact_round_trip_and_atomic_publication(tmp_path, monkeypatch):
     model = make_router()
-    joblib = MagicMock()
-    joblib.dump.side_effect = lambda head, path: Path(path).touch()
-    joblib.load.return_value = model.head
-    monkeypatch.setattr("sentimentizer.router.model._get_joblib", lambda: joblib)
+    model.head = _fitted_head()
     monkeypatch.setattr(
         "sentimentizer.router.model._get_sentence_transformers", lambda: lambda path: model.backbone
     )
@@ -179,7 +182,10 @@ def test_task_artifact_round_trip_and_atomic_publication(tmp_path, monkeypatch):
     loaded = RouterModel.from_pretrained(tmp_path)
     assert loaded.task == model.task
     assert loaded.classify_batch(["example"]) == model.classify_batch(["example"])
-    assert {p.name for p in tmp_path.iterdir()} == {"router_head.joblib", "router_config.json"}
+    assert {p.name for p in tmp_path.iterdir()} == {
+        "router_head.safetensors",
+        "router_config.json",
+    }
 
 
 def test_legacy_metadata_and_conflicting_sidecar(tmp_path):
@@ -264,7 +270,7 @@ def test_invalid_metadata_is_reported_without_loading(tmp_path, metadata):
 
 def test_failed_metadata_publication_keeps_previous_file_and_removes_temp(tmp_path, monkeypatch):
     model = make_router()
-    monkeypatch.setattr("sentimentizer.router.model._get_joblib", lambda: MagicMock())
+    model.head = _fitted_head()
     sidecar = tmp_path / "router_config.json"
     original = '{"labels": ["old", "labels"]}'
     sidecar.write_text(original)

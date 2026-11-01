@@ -522,6 +522,10 @@ required after any dashboard change.
 - Pipeline: `make router-augment` → `make router-train` → `make router-evaluate`;
   `make upload-router` pushes to the Hub.
 - Router ONNX export is deferred to v2 — the router runs Python inference.
+- **The head is stored without pickle** (`router/head.py`, `router_head.safetensors`).
+  `from_pretrained` never loads pickles; older artifacts migrate through
+  `sentimentizer router convert-head`, which uses an allowlisted unpickler. New head types
+  must be added to that format, not stored with joblib.
 
 ## Ray 2.55 API Conventions
 

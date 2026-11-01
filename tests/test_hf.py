@@ -771,6 +771,9 @@ class TestRouterAutoDownload:
             kwargs = mock_snap.call_args.kwargs
             assert kwargs["repo_id"] == HF_ROUTER_REPO
             assert kwargs["revision"] == HF_ROUTER_REVISION
+            # Serving never loads pickles, so it does not fetch them either.
+            assert "*.joblib" in kwargs["ignore_patterns"]
+            assert "*.pkl" in kwargs["ignore_patterns"]
             # Downloads go to a staging directory, published to the real path when complete.
             assert kwargs["local_dir"] != DEFAULT_ROUTER_MODEL_PATH
 

@@ -31,7 +31,11 @@ every field as hostile, and decide what happens when one is malformed.
 ## Downloaded artifacts
 
 - `torch.load` always uses `weights_only=True`.
-- **Pickle formats execute code on load.** The router head is a joblib file, so anything
-  auto-downloaded in that format must be pinned to a reviewed commit (`HF_ROUTER_REVISION`).
-  Do not add new pickle formats for downloaded artifacts.
+- **Pickle formats execute code on load.** Never call `joblib.load` or `pickle.load` on an
+  artifact in a serving or download path. Store numbers in safetensors or JSON, as
+  `router/head.py` does. One-time migrations use an allowlisted unpickler, and joblib's
+  object-array path must be blocked too because it calls an unrestricted `pickle.load`.
+- Pin auto-downloaded artifacts to a commit (`HF_ROUTER_REVISION`). A pin stops the content
+  from changing; it does not show that the content is safe. Do not call a pinned commit
+  reviewed unless someone reviewed it.
 - `trust_remote_code=True` requires a pinned `revision`.

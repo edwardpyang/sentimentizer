@@ -197,6 +197,7 @@ class SentimentPredictor:
         from huggingface_hub import snapshot_download
 
         from sentimentizer.config import HF_ROUTER_REPO, HF_ROUTER_REVISION
+        from sentimentizer.router.head import PICKLED_HEAD_PATTERNS
 
         path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=path.parent, prefix=f".{path.name}-") as staging:
@@ -205,6 +206,7 @@ class SentimentPredictor:
                 repo_id=HF_ROUTER_REPO,
                 revision=HF_ROUTER_REVISION,
                 local_dir=str(staged),
+                ignore_patterns=list(PICKLED_HEAD_PATTERNS),
             )
             staged.replace(path)
 

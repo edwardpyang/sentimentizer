@@ -54,6 +54,7 @@ ray = [
     "optuna>=4.8.0",
 ]
 router = [
+    "safetensors>=0.4.3",
     "sentence-transformers>=4.0.0",
     "datasets",
     "requests",
