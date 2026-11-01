@@ -9,7 +9,7 @@ on:
     paths:
       - 'pyproject.toml'
 
-# Only the publish job needs OIDC; it requests id-token itself.
+# Jobs request OIDC or repository writes only where required.
 permissions:
   contents: read
 
@@ -43,49 +43,13 @@ jobs:
             fi
           fi
 
-  lint:
+  verify:
     needs: check-version
     if: needs.check-version.outputs.should_publish == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-        with:
-          enable-cache: true
-      - name: set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: uv sync --extra dev
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-
-  test:
-    needs: [check-version, lint]
-    if: needs.check-version.outputs.should_publish == 'true'
-    runs-on: ubuntu-latest
-    env:
-      TZ: UTC
-      RAY_DISABLE_IMPORT_WARNING: 1
-      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
-      RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION: "0.5"
-      RAY_TQDM: "0"
-    steps:
-      - uses: actions/checkout@v4
-      - name: set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@v4
-        with:
-          enable-cache: true
-      - run: uv sync --extra dev,ray,onnx,router
-      - run: |
-          uv run pytest --exitfirst --verbose --failed-first \
-            --cov=sentimentizer --cov-report=term-missing --cov-report=html
+    uses: ./.github/workflows/verify.yaml
 
   publish:
-    needs: [check-version, test]
+    needs: [check-version, verify]
     if: |
       needs.check-version.outputs.should_publish == 'true' &&
       (github.event_name == 'push' || (github.event_name == 'release' && github.event.release.target_commitish == 'main'))
@@ -103,7 +67,30 @@ jobs:
       - uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
-      - run: uv sync --extra dev
+      - run: uv sync --locked --extra dev
       - run: uv build
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: publish
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: github-release-${{ github.sha }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: create version tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/publish_release.py

@@ -55,12 +55,19 @@ Treat the code as the source of truth when they disagree.
 branch is pushed after the bump.** Run `uv version --bump <patch|minor|major> --no-sync`, then
 `make ci`, commit, and push. See `.rules/versioning.md` for choosing the level.
 Merging a version change to `main` publishes to PyPI (`.github/workflows/publish.yaml`).
+After a successful main-branch publish, CD creates a bare-version Git tag and
+GitHub release with generated notes at the exact published commit. Existing tags
+are reused only when they resolve to that commit; CD never moves version tags.
+Only the follow-up release job receives `contents: write`. Its `GITHUB_TOKEN`
+does not recursively trigger the release-published workflow.
 
 ## Verification
 
 **`make ci` is the completion gate for any code change.** It runs
 `check` (ruff format, ruff fix, ruff check), then `typecheck` (pyright), then
-`test` (pytest) — the same four gates CI enforces, in the same order.
+`test` (pytest), a package build, and an isolated installed-wheel smoke check.
+CI and PyPI publishing share `.github/workflows/verify.yaml`, which also runs
+pandas-floor compatibility tests and a Docker smoke check outside the source tree.
 
 ```bash
 make ci        # full local mirror of CI — run before pushing
@@ -68,6 +75,7 @@ make check     # format + autofix + lint only (fast inner loop)
 make typecheck # pyright
 make test      # pytest tests/
 make test-cov  # pytest with line and branch coverage
+make smoke-package # smoke an already-built wheel outside the checkout
 ```
 
 Rules:
@@ -82,9 +90,18 @@ Rules:
   before assuming the rest passes.
 - Run verification **only when code changed**. Documentation- and
   markdown-only changes do not need the suite.
-- pyright reports warnings that do not fail the build; only `error` counts.
+- Pyright enforces argument, return, call, attribute, optional-member, general
+  type, and import errors in the main config, router config/schemas, and serving
+  config/request-schema modules via module directives. Legacy modules retain
+  warnings while they migrate; only `error` counts fail the build.
 - CI publishes coverage to the run's job summary and a `coverage-report` artifact
-  (`coverage.xml`, `htmlcov/`). It is report-only: there is no `fail_under` gate.
+  (`coverage.xml`, `htmlcov/`), including after test failures when data exists.
+  Summaries include missing lines and mark unsuccessful test runs as partial.
+  It is report-only: there is no `fail_under` gate.
+- The installed-wheel smoke environment reuses dependency libraries through a
+  plain `.pth` path, without processing the checkout's editable-install hooks.
+  Both wheel and Docker checks assert package origins and bundled config, then
+  run CLI and serving help from a temporary working directory.
 
 ## Architecture
 
@@ -445,6 +462,10 @@ required after any dashboard change.
   on `BaseSentimentModel`). The scheduler is rebuilt with real optimizer-step
   counts in `Trainer.fit()` / `_train_func()` once the DataLoader length is
   known.
+- **Accumulation and scheduler updates share `_TrainingStepper`.** Each epoch
+  gets its own worker-local stepper in the single-node, callback, and Ray loops.
+  Incomplete final windows average their observed microbatches and update once;
+  scheduler budgets use `ceil(num_batches / gradient_accumulation_steps)`.
 - **`warmup_ratio` (default `0.06`) is the live knob**; `T_max` and
   `warmup_epochs` in `SchedulerParams` are legacy fields from per-epoch
   stepping. `CosineAnnealingLR` is no longer used anywhere — every model uses

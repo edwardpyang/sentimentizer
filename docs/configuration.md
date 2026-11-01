@@ -100,6 +100,11 @@ Owns operational concerns: the HTTP proxy, request limits, batching, CORS, and
 optional embeddings. Image settings moved to the imagenate service; any still set
 here are ignored with a warning.
 
+`load_serve_config()` requires YAML to contain a mapping (or an empty document).
+After environment overrides, Pydantic validates the values against `ServeConfig`
+and rejects unknown options and invalid field types with `ValueError`-compatible
+validation errors. The configuration remains a frozen Python dataclass.
+
 | Env var | Field | Type | Notes |
 | :--- | :--- | :--- | :--- |
 | `SENTIMENTIZER_DEFAULT_MODEL` | `default_model` | str | Sentiment model: `rnn`, `encoder`, `decoder`, `modernbert` |

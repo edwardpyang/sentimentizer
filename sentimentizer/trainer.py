@@ -252,9 +252,30 @@ BEST_CHECKPOINT_NAME = "best_model.pth"
 # ──────────────────────────────────────────────
 
 
+def _apply_optimizer_step(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    max_grad_norm: float = 1.0,
+    gradient_scale: float = 1.0,
+) -> float:
+    """Normalize a window's gradients, clip them, and update the optimizer once."""
+    if gradient_scale != 1.0:
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(gradient_scale)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm, norm_type=2)
+    optimizer.step()
+    return float(norm.item()) if isinstance(norm, torch.Tensor) else float(norm or 0.0)
+
+
+def _optimizer_steps_per_epoch(num_batches: int, grad_accum_steps: int) -> int:
+    """Include the final partial window when sizing a learning-rate schedule."""
+    return max(1, math.ceil(num_batches / max(1, grad_accum_steps)))
+
+
 def train_step(
     model: torch.nn.Module,
-    inputs: dict[str, torch.Tensor],
+    inputs: dict[str, torch.Tensor] | torch.Tensor,
     target: torch.Tensor,
     optimizer: torch.optim.Optimizer,
     loss_function: Callable,
@@ -269,6 +290,8 @@ def train_step(
 
     Returns a tuple of (loss_value, grad_norm).
     """
+    if grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be positive")
     is_accum_start = (accum_step_idx % grad_accum_steps) == 0
     is_window_end = (accum_step_idx % grad_accum_steps) == (grad_accum_steps - 1)
     is_accum_end = is_window_end or is_last_batch
@@ -288,16 +311,83 @@ def train_step(
 
     grad_norm = 0.0
     if is_accum_end:
-        norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), max_norm=max_grad_norm, norm_type=2
+        accumulated = (accum_step_idx % grad_accum_steps) + 1
+        grad_norm = _apply_optimizer_step(
+            model, optimizer, max_grad_norm, gradient_scale=grad_accum_steps / accumulated
         )
-        if isinstance(norm, torch.Tensor):
-            grad_norm = float(norm.item())
-        elif norm is not None:
-            grad_norm = float(norm)
-        optimizer.step()
 
     return loss.item() * grad_accum_steps, grad_norm
+
+
+class _TrainingStepper:
+    """Own accumulation and per-update scheduling for one epoch on one worker.
+
+    Every microbatch still runs a synchronized backward pass under DDP. The final
+    incomplete window averages its observed microbatches, just like a full window.
+    Construct a fresh stepper after each epoch or optimizer replacement.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+        loss_function: Callable,
+        *,
+        grad_accum_steps: int,
+        use_amp: bool,
+        device_type: str,
+    ) -> None:
+        if grad_accum_steps < 1:
+            raise ValueError("grad_accum_steps must be positive")
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.loss_function = loss_function
+        self.grad_accum_steps = grad_accum_steps
+        self.use_amp = use_amp
+        self.device_type = device_type
+        self._batches = 0
+        self._grad_norm = 0.0
+        inner_model = model.module if hasattr(model, "module") else model
+        self._step_per_batch = getattr(type(inner_model), "STEP_SCHEDULER_PER_BATCH", False)
+
+    def _step_scheduler(self) -> None:
+        if self._step_per_batch and self.scheduler is not None:
+            self.scheduler.step()
+
+    def step(
+        self, inputs: dict[str, torch.Tensor] | torch.Tensor, target: torch.Tensor
+    ) -> tuple[float, float]:
+        """Train one microbatch and return its loss and latest completed gradient norm."""
+        loss, grad_norm = train_step(
+            self.model,
+            inputs,
+            target,
+            self.optimizer,
+            self.loss_function,
+            use_amp=self.use_amp,
+            grad_accum_steps=self.grad_accum_steps,
+            accum_step_idx=self._batches,
+            device_type=self.device_type,
+        )
+        self._batches += 1
+        if self._batches % self.grad_accum_steps == 0:
+            self._grad_norm = grad_norm
+            self._step_scheduler()
+        return loss, self._grad_norm
+
+    def flush(self) -> float:
+        """Commit a partial window once, keeping its gradients at their mean scale."""
+        pending = self._batches % self.grad_accum_steps
+        if pending:
+            self._grad_norm = _apply_optimizer_step(
+                self.model, self.optimizer, gradient_scale=self.grad_accum_steps / pending
+            )
+            self.optimizer.zero_grad()
+            self._batches = 0
+            self._step_scheduler()
+        return self._grad_norm
 
 
 def val_step(
@@ -961,7 +1051,7 @@ class Trainer:
         """Replace the placeholder scheduler with one sized for the real training length."""
         sched_params = _get_sched_params(self.model_type)
         grad_accum = max(1, self.cfg.gradient_accumulation_steps)
-        total_steps = epochs * max(1, steps_per_epoch // grad_accum)
+        total_steps = epochs * _optimizer_steps_per_epoch(steps_per_epoch, grad_accum)
         warmup_ratio = getattr(sched_params, "warmup_ratio", 0.06)
         warmup_steps = max(1, round(warmup_ratio * total_steps))
         self.scheduler = _LinearWarmupCosineScheduler(
@@ -982,11 +1072,16 @@ class Trainer:
         loss_ema = 0.0
         update_every = self.cfg.ray_update_every if self.cfg.ray_update_every > 0 else 50
 
-        grad_accum_steps = self.cfg.gradient_accumulation_steps
-        use_amp = self.cfg.use_amp
-        accum_step_idx = 0
-        last_unflushed = False
-        batch_start_time = time.time()
+        stepper = _TrainingStepper(
+            model,
+            self.optimizer,
+            self.scheduler,
+            self.loss_function,
+            grad_accum_steps=self.cfg.gradient_accumulation_steps,
+            use_amp=self.cfg.use_amp,
+            device_type="cuda" if "cuda" in self.cfg.device else "cpu",
+        )
+        batch_start_time = time.monotonic()
         grad_norm = 0.0
 
         with logging_redirect_tqdm():
@@ -994,37 +1089,12 @@ class Trainer:
             batches = _iter_batches(model, pbar, self.cfg.batch_size, self.cfg.device)
             for i, (inputs, target) in enumerate(batches):
                 batch_size = target.size(0)
-                loss_val, step_grad_norm = train_step(
-                    model=model,
-                    inputs=inputs,
-                    target=target,
-                    optimizer=self.optimizer,
-                    loss_function=self.loss_function,
-                    use_amp=use_amp,
-                    grad_accum_steps=grad_accum_steps,
-                    accum_step_idx=accum_step_idx,
-                    is_last_batch=False,
-                    device_type="cuda" if "cuda" in self.cfg.device else "cpu",
-                )
+                loss_val, grad_norm = stepper.step(inputs, target)
 
-                if (accum_step_idx % grad_accum_steps) == (grad_accum_steps - 1):
-                    grad_norm = step_grad_norm
-
-                now = time.time()
+                now = time.monotonic()
                 elapsed = now - batch_start_time
                 throughput = batch_size / elapsed if elapsed > 0 else 0.0
                 batch_start_time = now
-
-                accum_step_idx += 1
-                last_unflushed = (accum_step_idx % grad_accum_steps) != 0
-
-                # Per-batch scheduler step: fire after each completed accumulation window
-                if (
-                    getattr(type(model), "STEP_SCHEDULER_PER_BATCH", False)
-                    and self.scheduler is not None
-                    and (accum_step_idx % grad_accum_steps) == 0
-                ):
-                    self.scheduler.step()
 
                 epoch_loss_sum += loss_val * batch_size
                 epoch_sample_count += batch_size
@@ -1050,16 +1120,7 @@ class Trainer:
                         grad_norm=grad_norm,
                     )
 
-        if grad_accum_steps > 1 and last_unflushed:
-            torch.nn.utils.clip_grad.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            # Flush the partial accumulation window's scheduler step too
-            if (
-                getattr(type(model), "STEP_SCHEDULER_PER_BATCH", False)
-                and self.scheduler is not None
-            ):
-                self.scheduler.step()
+        stepper.flush()
 
         # Store per-epoch weighted average for evaluate() to consume
         self._epoch_loss_sum = epoch_loss_sum  # type: ignore[attr-defined]
@@ -1109,7 +1170,9 @@ class Trainer:
                 # so we can fast-forward the rebuilt scheduler.
                 steps_per_epoch_est = len(train_loader)
                 grad_accum = max(1, self.cfg.gradient_accumulation_steps)
-                completed_steps = (start_epoch - 1) * max(1, steps_per_epoch_est // grad_accum)
+                completed_steps = (start_epoch - 1) * _optimizer_steps_per_epoch(
+                    steps_per_epoch_est, grad_accum
+                )
                 logger.warning(
                     f"[{self.model_type}] checkpoint had no scheduler state, "
                     f"rebuilding scheduler and fast-forwarding {completed_steps} steps "
@@ -1327,7 +1390,9 @@ def _run_training_loop(
     batch_size: int = 32,
     update_every: int = 50,
 ) -> TrainingState:
-    """Unified training loop used by all three paths (single-node, distributed, tuning).
+    """Run callback-driven training using the shared optimizer-step implementation.
+
+    Multi-epoch runs require reiterable training and validation data sources.
 
     Args:
         model: The model to train.
@@ -1353,9 +1418,6 @@ def _run_training_loop(
         cb.on_train_begin(model_type, device, epochs)
 
     device_type = "cuda" if "cuda" in device else "cpu"
-    accum_step_idx = 0
-    last_unflushed = False
-
     for epoch in range(1, epochs + 1):
         # Training
         model.train()
@@ -1364,34 +1426,22 @@ def _run_training_loop(
 
         loss_ema = 0.0
         current_update_every = update_every if update_every > 0 else 50
+        stepper = _TrainingStepper(
+            model,
+            optimizer,
+            scheduler,
+            loss_function,
+            grad_accum_steps=grad_accum_steps,
+            use_amp=use_amp,
+            device_type=device_type,
+        )
 
         with logging_redirect_tqdm():
             pbar = tqdm(train_iter, desc=f"[{model_type}] epoch {epoch}", leave=False)
             batches = _iter_batches(model, pbar, batch_size, device)
             for i, (inputs, target) in enumerate(batches):
                 curr_batch_size = target.size(0)
-                loss_val, _ = train_step(
-                    model=model,
-                    inputs=inputs,
-                    target=target,
-                    optimizer=optimizer,
-                    loss_function=loss_function,
-                    use_amp=use_amp,
-                    grad_accum_steps=grad_accum_steps,
-                    accum_step_idx=accum_step_idx,
-                    is_last_batch=False,
-                    device_type=device_type,
-                )
-                accum_step_idx += 1
-                last_unflushed = (accum_step_idx % grad_accum_steps) != 0
-
-                # Per-batch scheduler step (all models)
-                if (
-                    getattr(type(model), "STEP_SCHEDULER_PER_BATCH", False)
-                    and scheduler is not None
-                    and (accum_step_idx % grad_accum_steps) == 0
-                ):
-                    scheduler.step()
+                loss_val, _ = stepper.step(inputs, target)
 
                 epoch_loss_sum += loss_val * curr_batch_size
                 epoch_sample_count += curr_batch_size
@@ -1412,13 +1462,7 @@ def _run_training_loop(
                         lr=f"{optimizer.param_groups[0]['lr']:.6f}",
                     )
 
-        # Flush partial accumulation window left over at epoch boundary
-        if grad_accum_steps > 1 and last_unflushed:
-            torch.nn.utils.clip_grad.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            if getattr(type(model), "STEP_SCHEDULER_PER_BATCH", False) and scheduler is not None:
-                scheduler.step()
+        stepper.flush()
 
         train_loss = epoch_loss_sum / epoch_sample_count if epoch_sample_count > 0 else 0.0
         state.latest_train_loss = train_loss
@@ -1883,7 +1927,9 @@ def _train_func(config: dict) -> None:
         _grad_accum = max(1, config.get("gradient_accumulation_steps", 1))
         if _train_dataset_count > 0:
             _per_worker_rows = math.ceil(_train_dataset_count / max(1, _num_workers))
-            _steps_per_epoch = max(1, math.ceil(_per_worker_rows / batch_size) // _grad_accum)
+            _steps_per_epoch = _optimizer_steps_per_epoch(
+                math.ceil(_per_worker_rows / batch_size), _grad_accum
+            )
         else:
             _steps_per_epoch = 100  # conservative fallback; logged as warning
             logger.warning(
@@ -1974,46 +2020,28 @@ def _train_func(config: dict) -> None:
         use_amp = config.get("use_amp", False)
         grad_accum_steps = config.get("gradient_accumulation_steps", 1)
         device_type = "cuda" if "cuda" in str(device) else "cpu"
-        accum_step_idx_epoch = 0
-        last_unflushed_epoch = False
-        batch_start_time = time.time()
+        stepper = _TrainingStepper(
+            model,
+            optimizer,
+            scheduler,
+            loss_function,
+            grad_accum_steps=grad_accum_steps,
+            use_amp=use_amp,
+            device_type=device_type,
+        )
+        batch_start_time = time.monotonic()
         grad_norm = 0.0
 
         with ctx:
             for i, batch in enumerate(train_pbar):
                 inputs, target = inner_model.prepare_batch(batch, device)
                 bs = target.size(0)
-                loss_val, step_grad_norm = train_step(
-                    model,
-                    inputs=inputs,
-                    target=target,
-                    optimizer=optimizer,
-                    loss_function=loss_function,
-                    use_amp=use_amp,
-                    grad_accum_steps=grad_accum_steps,
-                    accum_step_idx=accum_step_idx_epoch,
-                    is_last_batch=False,
-                    device_type=device_type,
-                )
+                loss_val, grad_norm = stepper.step(inputs, target)
 
-                if (accum_step_idx_epoch % grad_accum_steps) == (grad_accum_steps - 1):
-                    grad_norm = step_grad_norm
-
-                now = time.time()
+                now = time.monotonic()
                 elapsed = now - batch_start_time
                 throughput = bs / elapsed if elapsed > 0 else 0.0
                 batch_start_time = now
-
-                accum_step_idx_epoch += 1
-                last_unflushed_epoch = (accum_step_idx_epoch % grad_accum_steps) != 0
-
-                # Per-batch scheduler step (all models)
-                if (
-                    getattr(type(inner_model), "STEP_SCHEDULER_PER_BATCH", False)
-                    and scheduler is not None
-                    and (accum_step_idx_epoch % grad_accum_steps) == 0
-                ):
-                    scheduler.step()
 
                 epoch_loss_sum += loss_val * bs
                 epoch_sample_count += bs
@@ -2062,16 +2090,7 @@ def _train_func(config: dict) -> None:
                             grad_norm=grad_norm,
                         )
 
-        # Flush partial gradient accumulation window at epoch boundary
-        if grad_accum_steps > 1 and last_unflushed_epoch:
-            torch.nn.utils.clip_grad.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            if (
-                getattr(type(inner_model), "STEP_SCHEDULER_PER_BATCH", False)
-                and scheduler is not None
-            ):
-                scheduler.step()
+        stepper.flush()
 
         # Backbone unfreezing for HF models (e.g. ModernBERT)
         freeze_backbone_epochs = config.get("freeze_backbone_epochs", 0)
