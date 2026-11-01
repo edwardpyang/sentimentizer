@@ -74,6 +74,7 @@ ENCODERS = {
     "bge-small-en-v1.5": "BAAI/bge-small-en-v1.5",
     "bge-base-en-v1.5": "BAAI/bge-base-en-v1.5",
     "mxbai-embed-large-v1": "mixedbread-ai/mxbai-embed-large-v1",
+    "modernbert-base": "answerdotai/ModernBERT-base",
 }
 REVIEWS_PER_BUSINESS = 40
 MIN_REVIEW_WORDS = 30
