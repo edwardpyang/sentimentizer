@@ -295,7 +295,7 @@ HF_WEIGHTS_REPOS: dict[str, str] = {
 HF_ROUTER_REPO: str = "ryeyoo/sentimentizer-router"
 # Auto-download only this exact commit, so a later upload to the repo cannot change what
 # deployments load. Update it after each `make upload-router`.
-HF_ROUTER_REVISION: str = "8cc4ca2b1f09da940ff1ca9ab1cd0d73ef0ed717"
+HF_ROUTER_REVISION: str = "eabc9b71594063948f1f6da3ecc28d0ce02d41f8"
 
 
 @dataclass
