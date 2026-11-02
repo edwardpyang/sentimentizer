@@ -311,6 +311,11 @@ can resume; legacy generated rows without lineage must be regenerated. Use one
 writer per output file. Changing the task or seed/source identities requires a new
 output file rather than guessing lineage.
 
+### Compare encoders on real reviews
+
+[router-encoder-benchmark.md](../reports/router-encoder-benchmark.md) compares encoders on Yelp cuisine
+labels with `scripts/router_cuisine_benchmark.py`. Cuisine is a proxy task.
+
 ### Compare training approaches
 
 ```bash
