@@ -116,8 +116,8 @@ pool once.
 | 8,192 | 7 | 2,955 | 24 M | 169 M |
 | 32,768 | 4 | 2,808 | 92 M | 368 M |
 
-The total is about 550 M tokens. Throughput at long windows is unknown, so no duration estimate is
-given yet. Milestone 3 measures it.
+The total is about 550 M tokens. This is the full matrix. At the estimated speeds it would take weeks, so
+the phases below run a much smaller set first.
 
 ## Architecture
 
@@ -149,7 +149,7 @@ python scripts/router_long_prompt_benchmark.py run --data <jsonl> --filler <json
 Results append to the JSONL log with `kind="long_prompt"`, `encoder="<name>@<window>"`,
 `shots=<prompt tokens>` and `head="<method>/<position>"`. The existing `report --log` reads them.
 
-New or changed functions for milestone 1:
+New or changed functions for the Phase 1 fixes:
 
 ```python
 def split_filler(stream: list[int]) -> tuple[list[int], list[int]]: ...
@@ -162,28 +162,73 @@ call site each.
 
 ## Implementation order
 
-Every code milestone ends with `make ci`. Nothing here starts before the current encoder queue ends,
-because both compete for the GPU and the queue records timings.
+The work is split so the cheapest answer comes first, and each phase decides whether the next is worth
+running. Every code step ends with `make ci`. Time estimates extrapolate from one measurement,
+`bge-base-en-v1.5` at 512 tokens (115,645 tokens/s, 1.1 GB peak), and could be off by about 3x either way.
+Preflight replaces them with measurements.
 
-1. **Fix the draft script.** Resolve every open item in the review findings. Add a regression test
+### Phase 1: fast comparison (about 3 hours)
+
+Does a longer window beat small windows with good aggregation? This phase uses 1 seed and 10 prompts
+per class, at all three prompt lengths.
+
+| Configuration | Tokens | Estimated time |
+|---|---|---|
+| `bge-base-en-v1.5@512` | 2 M | Under 1 min |
+| `mxbai-embed-large-v1@512`, `bge-m3@512` | 2 M each | About 1 min each |
+| `qwen3-0.6b@512` | 2 M | About 2 min |
+| `bge-m3@8192` | 7 M | About 50 min |
+| `modernbert-large@8192` | 7 M | Up to about 1 hour |
+| `qwen3-0.6b@8192` | 7 M | About 80 min |
+
+1. **Fix the draft script.** Resolve every open item in the review findings and add a regression test
    for each. Add the `preflight` stage.
-2. **Validate NVFP4 embeddings.** Start one vLLM server per model. Embed 200 short reviews and compare
+2. **Preflight the Phase 1 configurations.** Encode a few full-length windows, and record peak GPU memory
+   and tokens per second. Record out-of-memory as a result.
+3. **Pilot.** Run `bge-base@512` first and check the sanity conditions in the analysis section.
+4. **Run the rest**, cheapest first, and report the results.
+
+**Gate:** the user decides on Phase 2 from these results:
+
+- If a 512-token window already holds up at every position, longer windows have little left to prove.
+  Skip the rest of Phase 2.
+- If accuracy improves from 512 to 8,192, Phase 2 tests whether that continues at 32,768.
+- If nothing beats chance at 200k tokens, go to Phase 4, since text-generation models become the main
+  hope.
+
+### Phase 2: long windows and NVFP4 (about 2 days)
+
+Uses the same 1 seed and 10 prompts per class.
+
+1. **Validate NVFP4 embeddings.** Start one vLLM server per model. Embed 200 short reviews and compare
    them with the full-precision reference by cosine similarity, running the reference on CPU if it
    will not fit on the GPU. Require a median above 0.95, a threshold chosen to catch broken pooling
    rather than small quantization drift. Exclude any checkpoint that fails and record why.
-3. **Preflight every configuration.** Encode a few full-length windows and record peak GPU memory and
-   tokens per second. Record out-of-memory as a result. Project the full run time.
-4. **Pilot.** Run `bge-base@512` and `qwen3-0.6b@32768` with 1 seed. Check the sanity conditions in
-   the analysis section before going further.
-5. **Full run, cheapest window first.** Run 512, then 8,192, then 32,768. If preflight projects more
-   than 6 hours for a configuration, run it with 1 seed and mark it as such in the report.
-6. **Text-generation ranking.** Add the adapter and prompt constants, with tests using a fake
-   server. Run the chosen models on the cuisine ranking set, at 0, 8 and 32 examples per class.
-7. **Text-generation long prompts.** Run the pilot from the prompt budget. Continue only if the
-   measured time and cost are approved.
-8. **End-to-end `ModernBERT`.** Add training code for arbitrary labels, then run it on both tasks.
-9. **Report.** Update `reports/router-encoder-benchmark.md` and `docs/router.md`, then mark this plan
-   complete.
+2. **Preflight, then run:** `qwen3-0.6b@32768` (about 17 hours), `qwen3-8b-nvfp4@8192` (about 15 hours),
+   and `nemotron-1b-nvfp4@8192` (about 2 hours). Add `nemotron-1b-nvfp4@32768` (about 30 hours) only if
+   `qwen3-0.6b@32768` beat its 8,192-token result.
+
+### Phase 3: confirm the leaders (time set by earlier measurements)
+
+Run the top two or three configurations with 3 seeds and 20 prompts per class. The other configurations,
+including `qwen3-4b@8192`, `nemotron-1b` BF16 and `qwen3-8b-nvfp4@32768` (estimated at hundreds of hours), run
+only if a result points to them.
+
+### Phase 4: text-generation models
+
+1. Add the adapter and prompt constants, with tests using a fake server.
+2. Run the chosen models on the cuisine ranking set, at 0, 8 and 32 examples per class.
+3. Run the long-prompt pilot from the prompt budget. Continue only if the measured time and cost are
+   approved. Hosted runs need explicit approval first.
+
+### Phase 5: end-to-end `ModernBERT`
+
+Add training code for arbitrary labels, then run it on both tasks.
+
+### Report
+
+Update `reports/router-encoder-benchmark.md` and `docs/router.md` after each phase. Mark this plan
+complete when the phases that were run are reported and the rest are recorded as skipped, with reasons.
 
 ## Analysis
 
@@ -217,7 +262,7 @@ GPU memory and windows per 200k-token prompt.
 - Resume with no re-encoding, and failures leaving no cached file.
 - vLLM response ordering, truncation and server failure.
 
-New for milestone 1:
+New for the Phase 1 fixes:
 
 - Train and test filler are disjoint.
 - Changing a run parameter does not reuse cached embeddings.
@@ -240,12 +285,12 @@ Second review, after those resolutions:
 
 | Risk | Resolution |
 |---|---|
-| 8B NVFP4 is a third-party build with no sentence-transformers pooling metadata, and vLLM may pool it wrongly | Milestone 2 compares it with the original. Exclude it if that fails |
-| vLLM 0.25.0 is NVIDIA's tested version for Nemotron, not necessarily for the Qwen build | Milestone 2 covers this. Record the outcome rather than assuming |
-| `truncate_prompt_tokens` and `--max-model-len` behavior is unverified for this path | Milestone 2 sends over-length input and checks the result |
-| `Nemotron-3-Embed-1B-BF16` is named in the NVFP4 model card but has not been loaded | Milestone 3 confirms it. Drop the configuration if it fails |
+| 8B NVFP4 is a third-party build with no sentence-transformers pooling metadata, and vLLM may pool it wrongly | Phase 2 compares it with the original. Exclude it if that fails |
+| vLLM 0.25.0 is NVIDIA's tested version for Nemotron, not necessarily for the Qwen build | Phase 2 validation covers this. Record the outcome rather than assuming |
+| `truncate_prompt_tokens` and `--max-model-len` behavior is unverified for this path | Phase 2 validation sends over-length input and checks the result |
+| `Nemotron-3-Embed-1B-BF16` is named in the NVFP4 model card but has not been loaded | Preflight confirms it if that configuration is ever run. Drop the configuration if it fails |
 | Long windows run out of memory | Recorded as a result. The batch size is already 1 at 32,768 |
-| The full run may be too slow | Milestones 3 and 5 measure first and limit seeds if needed |
+| The full run may be too slow | Phases run the cheapest configurations first, and preflight measures before each |
 | Signals never straddle a window boundary | Flatters all windowed methods, most of all small windows. Stated in the report. A straddling test is a possible follow-up if small windows win narrowly |
 | Filler differs from real prompts | Stated in the report. Only a real prompt sample resolves it |
 | A hosted model receives review text from a third-party dataset, and later real prompts | No hosted run starts without explicit approval. Check the Yelp dataset terms first |
