@@ -47,7 +47,7 @@ jobs:
       id: tests
       run: |
         uv run pytest --exitfirst --verbose --failed-first \
-          --cov --cov-report=term-missing --cov-report=xml --cov-report=html
+          --cov --cov-report=term-missing
 
     - name: publish coverage summary
       if: ${{ always() && !cancelled() && hashFiles('.coverage') != '' }}
@@ -56,17 +56,6 @@ jobs:
       run: |
         uv run --no-sync python .github/scripts/coverage_summary.py \
           --test-outcome "$TEST_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
-
-    - name: upload coverage reports
-      if: ${{ always() && !cancelled() && hashFiles('coverage.xml') != '' }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: coverage-report
-        path: |
-          coverage.xml
-          htmlcov/
-        if-no-files-found: error
-        retention-days: 14
 
     - name: build and smoke installed wheel
       run: |
