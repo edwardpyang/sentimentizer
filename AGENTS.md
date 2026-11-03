@@ -97,8 +97,9 @@ Rules:
   type, and import errors in the main config, router config/schemas, and serving
   config/request-schema modules via module directives. Legacy modules retain
   warnings while they migrate; only `error` counts fail the build.
-- CI publishes coverage to the run's job summary and a `coverage-report` artifact
-  (`coverage.xml`, `htmlcov/`), including after test failures when data exists.
+- CI publishes coverage to the run's job summary (and the pytest log via
+  `term-missing`), including after test failures when data exists. No coverage
+  artifact is uploaded.
   Summaries include missing lines and mark unsuccessful test runs as partial.
   It is report-only: there is no `fail_under` gate.
 - The installed-wheel smoke environment reuses dependency libraries through a
