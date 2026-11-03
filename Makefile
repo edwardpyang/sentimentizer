@@ -1,6 +1,6 @@
 .PHONY: setup setup-ci setup-dev smoke-package download-data train train-rnn train-encoder train-decoder train-modernbert \
        train-distributed train-quick train-no-checkpoint train-resume serve test test-verbose test-lint test-cov lint format check typecheck ci clean docker-build docker-run \
- 	   gpu-reset tune tune-rnn tune-encoder tune-decoder tune-standalone \
+ 	   gpu-reset tune tune-rnn tune-encoder tune-decoder tune-standalone tune-agent \
  	   start-metrics stop-metrics setup-dashboards start-exporter stop-exporter stop-ray \
  	   upload-rnn upload-encoder upload-decoder upload-modernbert upload-router \
  	   download-rnn download-encoder download-decoder download-modernbert \
@@ -44,7 +44,7 @@ setup-mps:
 
 ## Install dependencies with dev tools (pytest, ruff, pyright, etc.)
 setup-dev:
-	uv sync --extra dev --extra ray --extra router --extra onnx
+	uv sync --extra dev --extra ray --extra router --extra onnx --extra agent
 
 # ──────────────────────────────────────────────
 # Data
@@ -128,7 +128,7 @@ train-only:
 # Tuning
 # ──────────────────────────────────────────────
 
-## Run tuning workflow with agent-guided loop and model validation
+## Run tuning workflow (standalone Ray Tune sweep) with model validation
 tune:
 	uv run sentimentizer --model $(MODEL) tune --save
 
@@ -144,9 +144,13 @@ tune-encoder:
 tune-decoder:
 	uv run sentimentizer --model decoder tune --save
 
-## Run tuning workflow in standalone mode (no LLM agent, single Ray Tune sweep)
+## Run tuning workflow in standalone mode (same as `make tune`; kept for compatibility)
 tune-standalone:
 	uv run sentimentizer --model $(MODEL) tune --mode standalone --save
+
+## Run tuning workflow with the LLM-guided agent loop (requires: uv sync --extra agent)
+tune-agent:
+	uv run sentimentizer --model $(MODEL) tune --mode agent --save
 
 ## Quick tuning test with tiny dataset and few trials
 ## Usage: make tune-test MODEL=rnn STOP=100 SAMPLES=2

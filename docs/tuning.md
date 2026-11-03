@@ -1,6 +1,10 @@
 # Hyperparameter Tuning
 
 > **Note:** Hyperparameter tuning requires the `ray` extra: `uv add "sentimentizer[ray]"`
+>
+> The LLM-guided mode (`--mode agent`) also needs the
+> `agent` extra (LangGraph + Pydantic AI): `uv sync --extra ray --extra agent`.
+> `--mode standalone`, the default, does not.
 
 Sentimentizer offers three ways to tune hyperparameters, each at a different level of automation:
 
@@ -13,7 +17,7 @@ Sentimentizer offers three ways to tune hyperparameters, each at a different lev
 | **Auto-retry on failure** | ❌ | ❌ | ✅ Re-tunes up to `max_retries` times |
 | **Saves final model** | ❌ | ❌ | ✅ Trains & saves best model weights |
 | **Requires Ollama** | ❌ No | ✅ Yes | Only in agent mode |
-| **CLI** | `tune --mode standalone` | `tune --mode agent` | `tune --save` (agent mode by default) |
+| **CLI** | `tune --mode standalone` | `tune --mode agent` | `tune --save` (standalone by default) |
 | **When to use** | Quick sweep, no Ollama available | You want LLM-guided search but will handle model training yourself | You want a complete end-to-end pipeline |
 
 ## Standalone Tuning
@@ -107,8 +111,9 @@ The result is always written to `best_config.json`:
 ### Usage
 
 ```bash
-# Via Makefile (agent mode is the default)
+# Via Makefile (standalone is the default; tune-agent selects the LLM loop)
 make tune MODEL=encoder
+make tune-agent MODEL=encoder
 
 # Via CLI
 sentimentizer --model encoder tune --mode agent --save
@@ -121,8 +126,8 @@ sentimentizer --model encoder tune --mode standalone --save
 ```
 
 The tuning mode is selected with `--mode agent|standalone`; there is no
-`--agent-tune` flag. `make tune-standalone` is the Makefile shortcut for the
-standalone form.
+`--agent-tune` flag. The default is `standalone`; `make tune-agent` is the
+Makefile shortcut for the agent form.
 
 ## Tuning Workflow Pipeline
 

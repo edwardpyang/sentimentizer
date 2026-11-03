@@ -35,8 +35,6 @@ dependencies = [
     # FastAPI 0.139.x adds state that Ray Serve 2.55.1 cannot pickle after
     # its class-based-view transformation in @serve.ingress.
     "fastapi==0.136.1",
-    "pydantic-ai-slim[openai]>=1.93.0",
-    "langgraph>=1.1.10",
     "rich>=15.0.0",
     "huggingface_hub>=1.14.0",
     "click>=8.3.0",
@@ -70,6 +68,12 @@ onnx = [
     "onnxscript",
     # optimum-onnx not included: this project's ONNX needs are met by
     # onnxruntime.quantization.quantize_dynamic directly.
+]
+agent = [
+    # LLM-guided tuning loop (`sentimentizer tune --mode agent`). Standalone
+    # Ray Tune, training, and serving do not need these.
+    "pydantic-ai-slim[openai]>=1.93.0",
+    "langgraph>=1.1.10",
 ]
 dev = [
     "bumpver>=2025.1131",
