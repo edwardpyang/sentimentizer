@@ -37,9 +37,14 @@ def run_tune(
 
     if not is_ray_available():
         raise ImportError("Ray is required for tuning. Install with: pip install '.[ray]'")
+
+    from sentimentizer.agent.diagnose_model import TuningRun, TuningRunConfig, require_agent_extra
+
+    # Fail before starting Ray when agent mode lacks its optional deps.
+    if mode == "agent":
+        require_agent_extra()
     _ensure_ray_initialized()
 
-    from sentimentizer.agent.diagnose_model import TuningRun, TuningRunConfig
     from sentimentizer.device import resolve_device
 
     device = resolve_device(state.device)

@@ -169,7 +169,10 @@ uv sync --extra ray
 uv sync --extra dev --extra ray
 
 # Full development install
-uv sync --extra dev --extra ray --extra router --extra onnx
+uv sync --extra dev --extra ray --extra router --extra onnx --extra agent
+
+# LLM-guided tuning agent (LangGraph + Pydantic AI), only for `tune --mode agent`
+uv sync --extra ray --extra agent
 ```
 
 ### Local CUDA / GPU development

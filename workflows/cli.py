@@ -206,9 +206,12 @@ def train(ctx: click.Context, resume: bool, **kwargs: Any) -> None:
 @cli.command()
 @click.option(
     "--mode",
-    default="agent",
+    default="standalone",
     type=click.Choice(["agent", "standalone"]),
-    help="Tuning mode: agent (LLM-guided loop) or standalone (Ray Tune)",
+    help=(
+        "Tuning mode: standalone (Ray Tune sweep, default) or agent "
+        "(LLM-guided loop; needs the 'agent' extra)"
+    ),
 )
 @click.option("--agent-config", default=None, type=str, help="Path to agent config YAML")
 @click.option(

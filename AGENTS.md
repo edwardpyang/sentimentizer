@@ -209,8 +209,16 @@ uv run <command>                 # run in the venv
 ```
 
 Extras: `dev`, `ray`, `router` (sentence-transformers, scikit-learn), `onnx`,
-`embeddings`. Combos allowed: `uv sync --extra router,onnx`. CI installs
-`dev,ray,onnx,router`.
+`embeddings`, `agent` (langgraph, pydantic-ai — only for `tune --mode agent`).
+Combos allowed: `uv sync --extra router,onnx`. CI installs
+`dev,ray,onnx,router,agent`.
+
+- **The `agent` extra is optional.** Only `sentimentizer/agent/{agents,graph,nodes}.py`
+  import `langgraph`/`pydantic_ai`; keep those imports out of every other module.
+  `sentimentizer.agent` exposes `run_agent_tuning` lazily via `__getattr__`, and
+  `require_agent_extra()` (`agent/diagnose_model.py`) raises an install hint.
+  Tests that need the extra use the `requires_agent_extra` marker in
+  `tests/test_agent.py`.
 
 ### Running tests
 

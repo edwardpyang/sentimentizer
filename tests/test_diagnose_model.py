@@ -36,7 +36,7 @@ class TestTuningRunConfig:
         """TuningRunConfig should have sensible defaults."""
         config = TuningRunConfig()
         assert config.model_type == "rnn"
-        assert config.mode == "agent"
+        assert config.mode == "standalone"
         # None means "defer to the agent/tuner config YAML" — see _load_configs
         assert config.max_iterations is None
         assert config.convergence_threshold is None
@@ -431,7 +431,7 @@ class TestCreateTuningRun:
 
             config = mock_run.call_args.args[0]
             assert config.model_type == "rnn"
-            assert config.mode == "agent"
+            assert config.mode == "standalone"
             assert config.validate_predictions is True
 
     def test_creates_config_with_custom_values(self) -> None:

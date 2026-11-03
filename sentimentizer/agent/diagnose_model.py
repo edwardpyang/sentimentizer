@@ -32,6 +32,7 @@ Usage::
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import shutil
 import time
@@ -118,7 +119,7 @@ class TuningRunConfig:
 
     model_type: str = "rnn"
     config_path: str | None = None
-    mode: str = "agent"
+    mode: str = "standalone"
     max_iterations: int | None = None
     convergence_threshold: float | None = None
     num_samples: int | None = None
@@ -213,6 +214,24 @@ class TuningRunResult:
 # ---------------------------------------------------------------------------
 # TuningRun
 # ---------------------------------------------------------------------------
+
+
+AGENT_EXTRA_MODULES: tuple[str, ...] = ("langgraph", "pydantic_ai")
+
+
+def require_agent_extra() -> None:
+    """Raise ``ImportError`` if the optional ``agent`` extra is not installed.
+
+    Agent-guided tuning needs LangGraph and Pydantic AI; standalone tuning,
+    training, and serving do not, so these live in an optional extra.
+    """
+    missing = [name for name in AGENT_EXTRA_MODULES if importlib.util.find_spec(name) is None]
+    if missing:
+        raise ImportError(
+            f"Agent-guided tuning requires the 'agent' extra (missing: {', '.join(missing)}). "
+            "Install with: uv sync --extra agent  (or pip install 'sentimentizer[agent]'), "
+            "or run standalone tuning with: sentimentizer tune --mode standalone"
+        )
 
 
 class TuningRun:
@@ -458,6 +477,7 @@ class TuningRun:
         """
         import asyncio
 
+        require_agent_extra()
         from sentimentizer.agent.graph import run_agent_tuning
 
         agent_config, tuner_config = self._load_configs()
@@ -1404,7 +1424,7 @@ def _load_trained_model(model_type: str, model_path: str, device: str) -> Any:
 
 def create_tuning_run(
     model_type: str = "rnn",
-    mode: str = "agent",
+    mode: str = "standalone",
     config_path: str | None = None,
     num_samples: int | None = None,
     max_iterations: int | None = None,

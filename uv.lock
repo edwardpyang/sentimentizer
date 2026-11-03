@@ -3631,14 +3631,12 @@ dependencies = [
     { name = "fastapi" },
     { name = "gensim" },
     { name = "huggingface-hub" },
-    { name = "langgraph" },
     { name = "numpy" },
     { name = "orjson" },
     { name = "pandas" },
     { name = "prometheus-client" },
     { name = "psutil" },
     { name = "pyarrow" },
-    { name = "pydantic-ai-slim", extra = ["openai"] },
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "rich" },
@@ -3653,6 +3651,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+agent = [
+    { name = "langgraph" },
+    { name = "pydantic-ai-slim", extra = ["openai"] },
+]
 dev = [
     { name = "bumpver" },
     { name = "isort" },
@@ -3706,7 +3708,7 @@ requires-dist = [
     { name = "gensim", specifier = ">=4.4.0" },
     { name = "huggingface-hub", specifier = ">=1.14.0" },
     { name = "isort", marker = "extra == 'dev'", specifier = ">=8.0.0" },
-    { name = "langgraph", specifier = ">=1.1.10" },
+    { name = "langgraph", marker = "extra == 'agent'", specifier = ">=1.1.10" },
     { name = "numpy", specifier = ">=2.4.0" },
     { name = "onnx", marker = "extra == 'onnx'" },
     { name = "onnxruntime", marker = "extra == 'onnx'" },
@@ -3718,7 +3720,7 @@ requires-dist = [
     { name = "prometheus-client", specifier = ">=0.25.0" },
     { name = "psutil", specifier = ">=7.2.0" },
     { name = "pyarrow", specifier = ">=24.0.0" },
-    { name = "pydantic-ai-slim", extras = ["openai"], specifier = ">=1.93.0" },
+    { name = "pydantic-ai-slim", extras = ["openai"], marker = "extra == 'agent'", specifier = ">=1.93.0" },
     { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.350" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=7.1.0" },
@@ -3743,7 +3745,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.0" },
     { name = "transformers", specifier = ">=4.48.0" },
 ]
-provides-extras = ["ray", "router", "embeddings", "onnx", "dev"]
+provides-extras = ["ray", "router", "embeddings", "onnx", "agent", "dev"]
 
 [package.metadata.requires-dev]
 dev = [

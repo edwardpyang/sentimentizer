@@ -8,12 +8,21 @@ Tests cover:
 - Graph construction
 """
 
+import importlib.util
 import os
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
+
+from sentimentizer.agent.diagnose_model import AGENT_EXTRA_MODULES
+
+requires_agent_extra = pytest.mark.skipif(
+    any(importlib.util.find_spec(name) is None for name in AGENT_EXTRA_MODULES),
+    reason="requires the 'agent' extra (langgraph, pydantic-ai)",
+)
 
 # ─── Config Loader Tests ───────────────────────────────────────────
 
@@ -329,6 +338,7 @@ class TestSearchSpaceBuilding:
 # ─── Convergence Tests ──────────────────────────────────────────────
 
 
+@requires_agent_extra
 class TestConvergence:
     """Test convergence checking logic."""
 
@@ -406,6 +416,7 @@ class TestConvergence:
 # ─── Graph Construction Tests ───────────────────────────────────────
 
 
+@requires_agent_extra
 class TestGraphConstruction:
     """Test LangGraph state graph construction."""
 
@@ -428,6 +439,7 @@ class TestGraphConstruction:
         assert state["converged"] is False
 
 
+@requires_agent_extra
 class TestSearchBudget:
     """The web search budget is documented as per agent run."""
 
@@ -453,3 +465,67 @@ class TestSearchBudget:
 
         websearch._check_rate_limit()
         websearch.reset_rate_limit()
+
+
+# ─── Optional Agent Extra Tests ─────────────────────────────────────
+
+
+class TestAgentExtraOptional:
+    """Agent deps are optional: the package imports without them and fails clearly."""
+
+    _MISSING = ("_sentimentizer_missing_agent_dep",)
+
+    def _patch_missing(self):
+        return patch("sentimentizer.agent.diagnose_model.AGENT_EXTRA_MODULES", self._MISSING)
+
+    def test_require_agent_extra_names_missing_modules(self):
+        from sentimentizer.agent.diagnose_model import require_agent_extra
+
+        with self._patch_missing(), pytest.raises(ImportError, match="uv sync --extra agent") as e:
+            require_agent_extra()
+        assert self._MISSING[0] in str(e.value)
+
+    def test_lazy_run_agent_tuning_raises_install_hint(self):
+        import sentimentizer.agent as agent_pkg
+
+        with self._patch_missing(), pytest.raises(ImportError, match="'agent' extra"):
+            agent_pkg.run_agent_tuning  # noqa: B018
+
+    def test_unknown_attribute_raises_attribute_error(self):
+        import sentimentizer.agent as agent_pkg
+
+        with pytest.raises(AttributeError):
+            agent_pkg.does_not_exist  # noqa: B018
+
+    def test_agent_mode_fails_before_starting_ray(self):
+        # Importing workflows.lifecycle runs load_dotenv(); restore os.environ so a
+        # local .env does not leak SENTIMENTIZER_* vars into later tests.
+        with patch.dict(os.environ):
+            self._assert_agent_mode_fails_before_ray()
+
+    def _assert_agent_mode_fails_before_ray(self):
+        from workflows.lifecycle import State
+        from workflows.stages import tune as tune_stage
+
+        with (
+            self._patch_missing(),
+            patch("workflows.lifecycle.is_ray_available", return_value=True),
+            patch.object(tune_stage, "_ensure_ray_initialized") as ray_init,
+            pytest.raises(ImportError, match="'agent' extra"),
+        ):
+            tune_stage.run_tune(
+                State(model="rnn", device="cpu", run_type="new"),
+                mode="agent",
+                agent_config=None,
+                tune_samples=1,
+                tune_max_iterations=1,
+                tune_output_dir="unused",
+                no_validate=True,
+                validation_threshold=0.75,
+                max_retries=0,
+                save=False,
+                push_to_hub=False,
+                balance_classes=False,
+                balance_seed=42,
+            )
+        ray_init.assert_not_called()
